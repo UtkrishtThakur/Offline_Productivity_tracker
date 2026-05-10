@@ -1,0 +1,148 @@
+# ============================================================
+#  Tracker – Root .gitignore
+#  Covers: Rust (cargo), Python (venv / pip), Sessions (demo),
+#          IDE / Editor, OS, Secrets, Logs
+# ============================================================
+
+# --------------------------------------------------
+#  Rust / Cargo
+# --------------------------------------------------
+# Compiled output & build artifacts
+**/target/
+**/debug/
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# Cargo lock is intentionally tracked for binaries.
+# Uncomment the next line if this becomes a library:
+# Cargo.lock
+
+# --------------------------------------------------
+#  Python
+# --------------------------------------------------
+# Virtual environments (venv, virtualenv, conda, poetry, etc.)
+.venv/
+venv/
+ENV/
+env/
+.env/
+.conda/
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+wheels/
+*.whl
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / packaging
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# pytest / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.tox/
+.nox/
+
+# mypy / type-checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# pyenv
+.python-version
+
+# pipenv / poetry
+Pipfile.lock
+poetry.lock
+
+# --------------------------------------------------
+#  Session demo data
+# --------------------------------------------------
+sessions/
+
+# --------------------------------------------------
+#  Environment & Secrets
+# --------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.cert
+
+# --------------------------------------------------
+#  IDE / Editors
+# --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+*.sublime-workspace
+*.sublime-project
+.history/
+
+# --------------------------------------------------
+#  OS-specific
+# --------------------------------------------------
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# --------------------------------------------------
+#  Logs & Runtime artifacts
+# --------------------------------------------------
+*.log
+*.jsonl
+events.jsonl
+ActiveWindow.json
+
+# --------------------------------------------------
+#  Misc
+# --------------------------------------------------
+*.bak
+*.tmp
+*.orig
