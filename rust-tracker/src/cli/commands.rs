@@ -13,4 +13,5 @@ pub enum Commands {
     Pause,
     Resume,
     Stop,
+    Report,
 }
