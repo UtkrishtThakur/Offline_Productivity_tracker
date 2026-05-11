@@ -1,78 +1,26 @@
 mod cli;
 mod collector;
+mod config;
 mod models;
+mod session;
+mod storage;
+mod utils;
 
-use chrono::Local;
 use clap::Parser;
 
 use cli::commands::{Cli, Commands};
 
+use collector::linux::idle::get_idle_ms;
 use collector::linux::window::get_active_window;
 
-use models::event::Event;
+use session::manager::SessionManager;
 
 use serde_json::json;
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-fn log_event(
-    event_type: &str,
-    source: &str,
-    app: Option<String>,
-    title: Option<String>,
-    workspace: Option<i64>,
-    data: serde_json::Value,
-) {
-
-    let session_name = "active_session";
-
-    let session_path =
-        format!("../sessions/{}", session_name);
-
-    fs::create_dir_all(&session_path)
-        .expect("Failed to create session directory");
-
-    let log_file_path =
-        format!("{}/events.jsonl", session_path);
-
-    let event = Event {
-
-        timestamp:
-            Local::now().to_rfc3339(),
-
-        event_type:
-            event_type.to_string(),
-
-        source:
-            source.to_string(),
-
-        app,
-
-        title,
-
-        workspace,
-
-        data,
-    };
-
-    let json =
-        serde_json::to_string(&event)
-            .expect("Failed to serialize");
-
-    let mut file =
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file_path)
-            .expect("Failed to open log file");
-
-    writeln!(file, "{}", json)
-        .expect("Failed to write");
-}
+use storage::logger::log_event;
 
 fn main() {
 
@@ -88,6 +36,7 @@ fn main() {
                 None,
                 None,
                 None,
+                None,
                 json!({
                     "message": "Tracking started"
                 }),
@@ -95,46 +44,96 @@ fn main() {
 
             println!("Tracker started");
 
+            let mut manager =
+                SessionManager::new();
+
             let mut last_window:
                 Option<String> = None;
 
+            let mut focus_start =
+                Instant::now();
+
+            let mut idle_active = false;
+
             loop {
 
-                if let Some(window) =
+                // Idle detection
+                if let Some(idle_ms) =
+                    get_idle_ms()
+                {
+
+                    let idle_sec =
+                        idle_ms / 1000;
+
+                    if idle_sec
+                        >= SessionManager::IDLE_THRESHOLD_SEC
+                    {
+
+                        if !idle_active {
+
+                            manager.emit_idle(
+                                idle_sec
+                            );
+
+                            idle_active = true;
+                        }
+
+                        thread::sleep(
+                            Duration::from_secs(2)
+                        );
+
+                        continue;
+                    }
+                    else {
+
+                        idle_active = false;
+                    }
+                }
+
+                // Window tracking
+                if let Some(win) =
                     get_active_window()
                 {
+
+                    if win.app.is_empty() {
+                        continue;
+                    }
 
                     let current =
                         format!(
                             "{}::{}",
-                            window.app,
-                            window.title
+                            win.app,
+                            win.title
                         );
 
                     if Some(current.clone())
                         != last_window
                     {
 
-                        log_event(
-                            "window_focus",
-                            "window_tracker",
-                            Some(window.app.clone()),
-                            Some(window.title.clone()),
-                            Some(window.workspace),
-                            json!({
-                                "message": "Window changed"
-                            }),
+                        let duration =
+                            focus_start
+                                .elapsed()
+                                .as_secs();
+
+                        manager.process_window_session(
+                            win.app.clone(),
+                            win.title.clone(),
+                            win.workspace,
+                            duration,
                         );
 
                         println!(
-                            "Focused: {} | {} | Workspace {}",
-                            window.app,
-                            window.title,
-                            window.workspace
+                            "Focused: {} | {} | {} sec",
+                            win.app,
+                            win.title,
+                            duration
                         );
 
                         last_window =
                             Some(current);
+
+                        focus_start =
+                            Instant::now();
                     }
                 }
 
@@ -149,6 +148,7 @@ fn main() {
             log_event(
                 "tracker_paused",
                 "system",
+                None,
                 None,
                 None,
                 None,
@@ -168,6 +168,7 @@ fn main() {
                 None,
                 None,
                 None,
+                None,
                 json!({
                     "message": "Tracking resumed"
                 }),
@@ -181,6 +182,7 @@ fn main() {
             log_event(
                 "tracker_stopped",
                 "system",
+                None,
                 None,
                 None,
                 None,

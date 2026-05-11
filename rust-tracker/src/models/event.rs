@@ -16,5 +16,7 @@ pub struct Event {
 
     pub workspace: Option<i64>,
 
+    pub duration_sec: Option<u64>,
+
     pub data: Value,
 }
