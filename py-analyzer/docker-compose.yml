@@ -1,0 +1,16 @@
+services:
+  analyzer:
+    build: .
+
+    container_name: tracker-ai
+
+    network_mode: "host"
+
+    volumes:
+      - ../sessions:/sessions
+      - ./outputs:/app/outputs
+
+    env_file:
+      - .env
+
+    restart: unless-stopped
