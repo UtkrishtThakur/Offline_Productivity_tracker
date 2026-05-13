@@ -1,0 +1,57 @@
+# ============================================================================
+# rust-tracker — Configuration File
+# ============================================================================
+# This file controls the behavior of the Rust tracking engine and optionally
+# the Python AI analyzer. Every value can also be set via environment variable
+# (prefix: TRACKER_*) for containerized/headless deployments.
+#
+# Generate a fresh copy with: tracker init-config
+# Use with: tracker --config /path/to/tracker.toml start
+# ============================================================================
+
+[tracking]
+# How often to poll all collectors (seconds)
+poll_interval_sec = 3
+
+# How long to sleep during idle periods before re-checking (seconds)
+idle_sleep_sec = 2
+
+# Seconds of inactivity before we consider the user idle (splits activity groups)
+idle_threshold_sec = 120
+
+# Maximum gap in seconds between window events before starting a new activity group
+adjacency_window_sec = 300
+
+# Minimum window focus duration in seconds to be considered meaningful (noise filter)
+min_meaningful_sec = 2
+
+[storage]
+# Directory for session data (relative to CWD, or absolute path)
+session_dir = "../sessions/active_session"
+
+# Raw event log filename (within session_dir)
+events_file = "events.jsonl"
+
+# Normalized activity group filename (within session_dir)
+normalized_file = "normalized_sessions.jsonl"
+
+[ai_analyzer]
+# Enable AI-powered daily summaries via py-analyzer + Ollama
+# When false, tracker works fully without Python/AI dependencies
+enabled = false
+
+# Ollama API endpoint
+ollama_host = "http://localhost:11434"
+
+# LLM model to use for summaries
+model = "qwen2.5:7b"
+
+# Output directory for AI-generated summaries
+output_dir = "outputs"
+
+[logging]
+# Write log files to the session directory
+enable_file_logging = true
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"

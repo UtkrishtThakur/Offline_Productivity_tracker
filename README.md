@@ -18,8 +18,8 @@
 - **No scoring** — reports describe *what happened*, not *how good/bad it was*
 - **Multi-source collection** — window focus, idle detection, terminal commands, git activity
 - **Activity reconstruction** — groups related work into sessions with project/file/language context
-- **Human-readable reports** — neutral, factual summaries
-- **LLM-powered daily summaries** (optional) — local AI via Ollama for narrative daily reviews
+- **Fully configurable** — `tracker.toml` + environment variable overrides, no hardcoded values
+- **AI optional** — LLM-powered daily summaries toggle via `ai_analyzer.enabled`
 - **Cross-platform** — Linux (gnomectl/xprintidle) and Windows (Win32 API) collectors
 
 ---
@@ -28,8 +28,14 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
+│                     config/mod.rs + settings.rs                         │
+│           tracker.toml loading / env overrides / AppContext             │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
 │                              main.rs                                    │
-│                    Orchestration & Polling Loop (3s)                    │
+│                    Orchestration & Polling Loop                         │
 └──────┬──────────┬──────────┬──────────┬───────────┬────────────────────┘
        │          │          │          │           │
        ▼          ▼          ▼          ▼           ▼
@@ -41,57 +47,44 @@
      ▼           ▼             ▼           ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          SessionManager                                 │
-│              (session/manager.rs)                                       │
 │                                                                         │
-│  Owns: last_event buffer, ActivityGrouper                               │
-│  Merges identical consecutive window sessions                           │
-│  Routes events → enrich → grouper                                       │
-│  Handles idle boundaries & graceful shutdown                            │
+│  Owns: Logger, ActivityGrouper, last_event buffer                      │
+│  All thresholds from config, all paths from config                     │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         Enrichment Layer                                │
 │              (processing/enrich.rs)                                     │
-│                                                                         │
 │  extract_from_title() → project + file                                  │
 │  detect_language()    → language from file extension                    │
-│  normalize_app_name() → canonical app name (vscode, chrome, etc.)       │
-│  enrich_event()       → Event → EnrichedEvent                           │
+│  normalize_app_name() → canonical app name                              │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Activity Grouper                                 │
 │              (processing/activity.rs)                                   │
-│                                                                         │
-│  Groups by (project, app) key                                           │
-│  5-minute adjacency window for merging                                  │
-│  Idle boundary splits groups (>= 2 min idle)                            │
-│  Side-channels: terminal workflows + git summaries                      │
+│  Groups by (project, app) key, configurable adjacency window           │
+│  Idle boundary splits, terminal/git side-channels                      │
 │  Pushes completed ActivityGroup to storage                              │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Storage Layer                                   │
+│                     Storage Layer (Logger struct)                       │
 │              (storage/logger.rs)                                        │
-│                                                                         │
-│  ../sessions/active_session/                                            │
+│  Configurable paths: session_dir, events_file, normalized_file         │
 │    ├── events.jsonl               (raw Event JSONL)                    │
 │    └── normalized_sessions.jsonl  (ActivityGroup JSONL)                │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┴────────────────────┐
-        ▼                                        ▼
-┌───────────────────┐              ┌──────────────────────────────┐
-│   Report Layer    │              │      AI Analysis Layer       │
-│ (summary.rs)      │              │      (py-analyzer/)          │
-│                   │              │                              │
-│ format_report()   │              │ build_ai_context() → prompt  │
-│ → human-readable  │              │ ollama.chat() → summary      │
-│   terminal output │              │ write_summary() → daily .txt │
-└───────────────────┘              └──────────────────────────────┘
+└──────────┬──────────────────────────────────────────────────────────────┘
+           │
+     ┌─────┴──────────────────────┐
+     ▼                            ▼
+┌──────────────┐     ┌──────────────────────────────┐
+│   Report     │     │   AI Analysis (optional)     │
+│ (summary.rs) │     │   (py-analyzer/)             │
+└──────────────┘     └──────────────────────────────┘
 ```
 
 ---
@@ -101,65 +94,108 @@
 ```
 tracker/
 ├── rust-tracker/                      # Core Rust tracking engine
-│   ├── Cargo.toml                     # Rust deps: clap, serde, chrono, ctrlc
+│   ├── Cargo.toml                     # Rust deps: clap, serde, chrono, ctrlc, toml
 │   └── src/
-│       ├── main.rs                    # Entrypoint, polling loop, Ctrl+C handler
-│       ├── cli/commands.rs            # CLI: Start, Pause, Resume, Stop, Report
+│       ├── main.rs                    # Entrypoint, config loading, polling loop
+│       ├── cli/commands.rs            # CLI: Start/Pause/Resume/Stop/Report/ReportAi/InitConfig
+│       ├── config/
+│       │   ├── mod.rs                 # AppContext, config loader, env overrides, ConfigError
+│       │   └── settings.rs            # TrackerConfig, TrackingConfig, StorageConfig, AiAnalyzerConfig
 │       ├── collector/
-│       │   ├── linux/                 # Linux collectors
-│       │   │   ├── window.rs          # gnomectl JSON → WindowInfo
-│       │   │   ├── idle.rs            # xprintidle → ms
-│       │   │   ├── terminal.rs        # .bash_history → last command
-│       │   │   ├── git.rs             # git commands → JSON activity
-│       │   │   └── browser.rs         # PLACEHOLDER
-│       │   └── windows/               # Windows collectors
-│       │       ├── window.rs          # Win32 GetForegroundWindow
-│       │       ├── idle.rs            # Win32 GetLastInputInfo
-│       │       ├── terminal.rs        # PowerShell history
-│       │       ├── git.rs             # git status --porcelain
-│       │       └── browser.rs         # PLACEHOLDER
-│       ├── models/
-│       │   ├── event.rs               # Raw Event struct
-│       │   ├── enriched.rs            # EnrichedEvent (project, file, lang, app)
-│       │   └── activity.rs            # ActivityGroup, GitSummary
-│       ├── session/
-│       │   └── manager.rs             # SessionManager orchestrator
+│       │   ├── linux/                 # Window, idle, terminal, git collectors
+│       │   └── windows/               # Win32-based collectors
+│       ├── models/                    # Event, EnrichedEvent, ActivityGroup, GitSummary
+│       ├── session/manager.rs         # SessionManager orchestrator
 │       ├── processing/
 │       │   ├── enrich.rs              # Title parsing, lang detection, app normalization
-│       │   ├── activity.rs            # ActivityGrouper: merge, split, group
-│       │   ├── terminal.rs            # Command classification (8 workflow types)
-│       │   ├── git.rs                 # GitSummary builder, dev area detection
-│       │   └── summary.rs            # Human-readable report formatting
+│       │   ├── activity.rs            # Configurable ActivityGrouper
+│       │   ├── terminal.rs            # Command classification
+│       │   ├── git.rs                 # GitSummary builder
+│       │   └── summary.rs             # Human-readable report formatting
 │       ├── storage/
-│       │   ├── logger.rs              # JSONL append/read
+│       │   ├── logger.rs              # Logger struct (configurable paths)
 │       │   └── schema.rs              # PLACEHOLDER
-│       ├── config/
-│       │   ├── mod.rs                 # PLACEHOLDER
-│       │   └── settings.rs            # PLACEHOLDER
-│       └── utils/
-│           ├── mod.rs
-│           ├── paths.rs               # PLACEHOLDER
-│           └── time.rs                # PLACEHOLDER
+│       └── utils/                     # PLACEHOLDER (paths, time)
 │
 ├── py-analyzer/                       # Python AI analysis layer (optional)
-│   ├── analyzer.py                    # Main: reads JSONL → Ollama → daily summary
-│   ├── formatter.py                   # Loads & aggregates ActivityGroup JSONL
+│   ├── analyzer.py                    # Main entry point
+│   ├── config.py                      # AnalyzerConfig from env vars
+│   ├── formatter.py                   # JSONL loading + project aggregation
 │   ├── prompts.py                     # System + user prompt templates
-│   ├── memory.py                      # SessionMemory accumulator
-│   ├── guardrails.py                  # Banned word filter (no "productive", etc.)
-│   ├── daily_writer.py                # Writes summaries to outputs/{date}.txt
-│   ├── Dockerfile                     # python:3.12-slim container
-│   ├── docker-compose.yml             # mounts sessions/, network=host for Ollama
-│   ├── requirements.txt               # ollama, python-dotenv
-│   └── .env                           # MODEL, OLLAMA_HOST config
+│   ├── guardrails.py                  # Banned word filter
+│   ├── daily_writer.py                # Write summaries to outputs/{date}.txt
+│   ├── Dockerfile                     # python:3.12-slim
+│   ├── docker-compose.yml             # Mounts sessions/, network=host for Ollama
+│   └── .env                           # TRACKER_AI_* configuration
 │
+├── tracker.toml                       # Default config (generated by tracker init-config)
 ├── sessions/                          # Runtime session data (gitignored)
-│   └── active_session/
-│       ├── events.jsonl               # Raw event log
-│       └── normalized_sessions.jsonl   # Processed activity groups
-│
-├── CLAUDE.md                          # Full architecture guide (engineer-facing)
-└── .gitignore
+├── CLAUDE.md                          # Full architecture guide
+└── README.md
+```
+
+---
+
+## Configuration
+
+### `tracker.toml` reference
+
+```toml
+[tracking]
+poll_interval_sec = 3          # Main loop sleep (seconds)
+idle_sleep_sec = 2             # Sleep during idle
+idle_threshold_sec = 120       # Idle before splitting groups
+adjacency_window_sec = 300     # Max gap for merged events (5 min)
+min_meaningful_sec = 2         # Noise filter threshold
+
+[storage]
+session_dir = "../sessions/active_session"   # Session data directory
+events_file = "events.jsonl"                 # Raw event log
+normalized_file = "normalized_sessions.jsonl" # Normalized sessions
+
+[ai_analyzer]
+enabled = false                # Toggle AI summarization
+ollama_host = "http://localhost:11434"
+model = "qwen2.5:7b"
+output_dir = "outputs"
+
+[logging]
+enable_file_logging = true
+log_level = "info"
+```
+
+### Config resolution order
+
+1. **CLI `--config PATH`** — explicit path (must exist)
+2. **`TRACKER_CONFIG`** env var
+3. **`./tracker.toml`** — current working directory
+4. **`~/.config/tracker/tracker.toml`** — Linux platform dir
+5. **Built-in defaults** — no file required
+
+### Environment variable overrides
+
+Every config field can be overridden at runtime:
+
+| Env var | Config field | Default |
+|---------|-------------|---------|
+| `TRACKER_POLL_INTERVAL_SEC` | `tracking.poll_interval_sec` | `3` |
+| `TRACKER_IDLE_THRESHOLD_SEC` | `tracking.idle_threshold_sec` | `120` |
+| `TRACKER_ADJACENCY_WINDOW_SEC` | `tracking.adjacency_window_sec` | `300` |
+| `TRACKER_MIN_MEANINGFUL_SEC` | `tracking.min_meaningful_sec` | `2` |
+| `TRACKER_SESSION_DIR` | `storage.session_dir` | `../sessions/active_session` |
+| `TRACKER_EVENTS_FILE` | `storage.events_file` | `events.jsonl` |
+| `TRACKER_NORMALIZED_FILE` | `storage.normalized_file` | `normalized_sessions.jsonl` |
+| `TRACKER_AI_ENABLED` | `ai_analyzer.enabled` | `false` |
+| `TRACKER_AI_OLLAMA_HOST` | `ai_analyzer.ollama_host` | `http://localhost:11434` |
+| `TRACKER_AI_MODEL` | `ai_analyzer.model` | `qwen2.5:7b` |
+| `TRACKER_AI_OUTPUT_DIR` | `ai_analyzer.output_dir` | `outputs` |
+| `TRACKER_LOG_LEVEL` | `logging.log_level` | `info` |
+
+### Generate default config
+
+```bash
+tracker init-config
+# Writes tracker.toml to CWD with all defaults and documentation
 ```
 
 ---
@@ -168,95 +204,31 @@ tracker/
 
 ### Tracking Loop
 
-The main loop in `main.rs:run_tracking_loop()` polls every **3 seconds**:
+The main loop polls every `tracking.poll_interval_sec` (default 3s). All thresholds and paths come from config:
 
-1. **Idle Detection** — If `xprintidle` reports ≥ 120s of inactivity:
-   - Flush current window session
-   - Split activity groups at the idle boundary
-   - Log an `idle_session` event
-   - Skip other collectors, sleep 2s, repeat
-
-2. **Window Tracking** — Reads active window via `gnomectl` (Linux) or `GetForegroundWindow` (Windows):
-   - On app/title change: calculate elapsed focus duration, push to `SessionManager`
-   - Consecutive identical windows are **merged** (durations accumulated)
-   - `< 2s` windows are filtered as noise
-
-3. **Terminal Tracking** — Reads last command from shell history:
-   - On new command: classify (`classify_command`) into one of 8 workflow types
-   - Log event, push workflow label to current activity group
-
-4. **Git Tracking** — Runs `git rev-parse`, `git status --porcelain`, `git log`, `git rev-list`:
-   - On state change: log raw git event, build `GitSummary`, push to grouper
+1. **Idle Detection** — If idle >= `idle_threshold_sec` (default 120s): flush, split groups, sleep
+2. **Window Tracking** — On app/title change: push to `SessionManager`, merge consecutive identical windows, filter `< min_meaningful_sec` noise
+3. **Terminal Tracking** — On new command: classify into workflow type, log, push to group
+4. **Git Tracking** — On state change: log, build `GitSummary`, push to group
 
 ### Enrichment Pipeline
 
 Every window event passes through `processing/enrich.rs`:
-
-| Step | Function | Logic |
-|------|----------|-------|
-| App normalization | `normalize_app_name()` | Exact match → substring match → lowercase fallback |
-| Title parsing | `extract_from_title()` | Split on ` - ` / ` — `, find file segment (dot + known extension), find project segment (not app, not file) |
-| Language detection | `detect_language()` | File extension → lookup in 44-entry `LANGUAGE_MAP` |
+- **App normalization** — exact match → substring match → fallback
+- **Title parsing** — split on ` - ` / ` — `, find file segment, find project segment
+- **Language detection** — file extension → 44-entry lookup
 
 ### Activity Grouping
 
-`processing/activity.rs` implements a stateful `ActivityGrouper`:
+`processing/activity.rs` groups by `(project, app)` with configurable `adjacency_window_sec` and `min_meaningful_sec`. Idle boundaries split groups. Terminal workflows and git summaries inject into the current group as side-channels.
 
-- **Group key**: `(project: Option<String>, app: String)`
-- **Merge condition**: Same key + event duration < 300s (5 minute adjacency window)
-- **On merge**: Accumulate `total_duration_sec`, deduplicate `files_touched` and `languages`
-- **On split**: Finalize current group as `ActivityGroup` with `start_time`, `end_time`, accumulated fields
-- **Idle split**: `split_on_idle()` finalizes current group; next event starts fresh
-- **Side-channels**: Terminal workflows (deduplicated) and git summaries (latest wins) are injected into the current group
+### Storage
 
-### Storage Format
+`Logger` struct writes to configurable paths. Both `events.jsonl` (raw) and `normalized_sessions.jsonl` (processed) are JSONL — append-only, trivially inspectable.
 
-**JSONL** (JSON Lines) — one JSON object per line, append-only:
+### AI Summarization (Optional)
 
-- `events.jsonl` — Full raw event audit trail (`Event` struct)
-- `normalized_sessions.jsonl` — Processed activity groups (`ActivityGroup` struct)
-
-Path: `../sessions/active_session/` relative to the Rust binary.
-
-### Report Generation
-
-`processing/summary.rs` formats `ActivityGroup` data into a neutral, factual report:
-
-```
---- Activity Reconstruction Report ---
-
-Used vscode in:
-tracker
-
-Worked on:
-- main.rs
-- manager.rs
-
-Time spent:
-3 minutes, 15 seconds
-
-Terminal activity:
-- Rust build workflow
-- Git commit workflow
-
-Git activity:
-- 2 commits
-- Development areas: src, src/session
-
----
-```
-
-### AI Summarization Flow
-
-The optional Python layer (`py-analyzer/`) uses a local LLM via [Ollama](https://ollama.ai):
-
-1. `formatter.py` reads `normalized_sessions.jsonl` and aggregates by project
-2. `prompts.py` constructs a system prompt enforcing factual, non-judgmental output
-3. `analyzer.py` sends the aggregated data to Ollama for narrative summarization
-4. `guardrails.py` strips banned words ("productive", "lazy", "efficient", etc.)
-5. `daily_writer.py` saves the summary to `outputs/{YYYY-MM-DD}.txt`
-
-**Prompt philosophy**: The system prompt explicitly forbids hallucination, productivity scoring, motivational advice, and invented work. The LLM is used as a *formatting engine* for structured data, not as an inference engine.
+When `ai_analyzer.enabled = true`, `tracker report-ai` invokes `py-analyzer/analyzer.py` as a subprocess, forwarding all config values as environment variables. The Python layer reads `normalized_sessions.jsonl`, aggregates by project, sends to Ollama, and writes `outputs/{date}.txt`.
 
 ---
 
@@ -265,9 +237,9 @@ The optional Python layer (`py-analyzer/`) uses a local LLM via [Ollama](https:/
 ### Prerequisites
 
 - **Rust** 1.70+ (`rustup` recommended)
-- **Linux**: `gnomectl` (for window tracking) + `xprintidle` (for idle detection)
+- **Linux**: `gnomectl` + `xprintidle` for window/idle tracking
 - **Python** 3.12+ (optional, for AI analysis)
-- **Ollama** (optional, for AI analysis) — pull a model like `qwen2.5:7b`
+- **Ollama** (optional, for AI analysis)
 
 ### Build
 
@@ -276,7 +248,12 @@ cd rust-tracker
 cargo build --release
 ```
 
-The binary will be at `rust-tracker/target/release/tracker`.
+### Generate config
+
+```bash
+./target/release/tracker init-config
+# Edit tracker.toml to customize
+```
 
 ### AI Analyzer (Optional)
 
@@ -292,38 +269,28 @@ docker compose up -d
 ## Usage
 
 ```bash
-# Start the tracking loop
+# Start tracking (press Ctrl+C to stop)
 tracker Start
+tracker --config /path/to/tracker.toml Start
 
-# View the activity report (reads normalized_sessions.jsonl)
+# View activity report
 tracker Report
 
-# Log lifecycle events (currently log-only, loop runs synchronously in Start)
+# Generate AI daily summary (if enabled)
+tracker ReportAi
+
+# Log lifecycle events
 tracker Pause
 tracker Resume
 tracker Stop
 
-# Generate AI daily summary
-cd py-analyzer && python analyzer.py
+# Generate default config
+tracker InitConfig
 ```
-
-Press `Ctrl+C` during tracking to gracefully flush all pending sessions.
 
 ---
 
 ## Example Output
-
-### Raw Event (`events.jsonl`)
-
-```json
-{"timestamp":"2026-05-12T15:10:40.090512029+05:30","event_type":"window_session","source":"window_tracker","app":"Antigravity","title":"tracker - Antigravity - git.rs","workspace":0,"duration_sec":81,"data":{"message":"Normalized session"}}
-```
-
-### Normalized Session (`normalized_sessions.jsonl`)
-
-```json
-{"start_time":"2026-05-12T15:10:34.065395748+05:30","end_time":"2026-05-12T15:11:34.319094460+05:30","project":"tracker","app":"antigravity","total_duration_sec":81,"files_touched":["git.rs"],"languages":["rust"],"terminal_workflows":[],"git_summary":null}
-```
 
 ### CLI Report
 
@@ -348,98 +315,34 @@ Time spent:
 >
 > - **tracker**: Worked on Rust, spending 2.3 minutes on 'git.rs'.
 > - **Offline Productivity Tracker**: A brief session of 0.55 minutes with Chrome.
-> - **Spotify Premium**: Listening to music for 4.97 minutes using Spotify.
 >
-> Summary: The day consisted primarily of Rust programming, light web browsing, and listening to music.
+> Summary: The day consisted primarily of Rust programming and light web browsing.
 
 ---
 
 ## AI Pipeline
 
-### Architecture
+### Feature Toggle
 
-```
-normalized_sessions.jsonl
-         │
-         ▼
-  formatter.py ─── build_ai_context()
-         │          aggregates by project:
-         │          {project: {time_min, apps, files, languages,
-         │                     terminal_workflows, git_commits, dev_areas}}
-         ▼
-  prompts.py ───── SYSTEM_PROMPT (factual, no scoring, no hallucination)
-                  USER_PROMPT_TEMPLATE ({data})
-         ▼
-  analyzer.py ──── ollama.chat(model=MODEL, messages=[...])
-         │
-         ▼
-  guardrails.py ── sanitize_output() — strips banned judgment words
-         │
-         ▼
-  daily_writer.py ── write_summary() → outputs/{date}.txt
+In `tracker.toml`:
+```toml
+[ai_analyzer]
+enabled = false   # tracker works fully without Python/AI
 ```
 
-### Prompts
+When **disabled**: `tracker report-ai` exits with a message. The Rust tracking loop is completely unaffected.
 
-**System prompt:**
-```
-You are a local activity reconstruction engine.
-Rules:
-- Never hallucinate
-- Never invent work
-- Never assign productivity scores
-- Never give motivational advice
-- Be factual and concise
-- Summarize only provided data
-```
+When **enabled**: `tracker report-ai` runs `py-analyzer/analyzer.py` as a subprocess, forwarding:
+- `TRACKER_AI_OLLAMA_HOST` — Ollama endpoint
+- `TRACKER_AI_MODEL` — LLM model
+- `TRACKER_AI_OUTPUT_DIR` — output directory
+- `TRACKER_SESSION_DIR` + `TRACKER_NORMALIZED_FILE` — session data source
 
-**User prompt template:**
-```
-Generate a clean daily activity summary from this structured activity data:
-
-{data}
-```
+The Python `AnalyzerConfig` class reads these env vars with fallbacks for Docker compatibility.
 
 ### Guardrails
 
-`guardrails.py` strips these words from LLM output: `productive`, `lazy`, `efficient`, `inefficient`, `excellent`, `bad` — preventing the model from making qualitative judgments that contradict the project's "no scoring" philosophy.
-
----
-
-## Developer Notes
-
-### Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| **No ML in pipeline** | Enrichment is pure string parsing; reproducibility and auditability are guaranteed |
-| **JSONL over SQLite** | Append-only, trivially inspectable with `cat`/`jq`/`tail`, no schema migrations |
-| **Dual logging** | `events.jsonl` = raw audit trail; `normalized_sessions.jsonl` = processed view; both independently replayable |
-| **`#[serde(flatten)]` on EnrichedEvent** | Flat JSON output matching downstream consumer expectations |
-| **Compile-time platform selection** | Simpler than trait objects at current scale; `#[cfg]` avoids dynamic dispatch |
-| **5-minute adjacency window** | Balances merge aggressiveness vs. fragmentation; validated against real usage |
-| **2-second noise filter** | Eliminates alt-tab flicker and workspace switches without meaningful focus |
-| **Single-threaded loop** | Collector calls are fast I/O (< 50ms); async/channels add complexity without benefit at this scale |
-
-### Known Technical Debt
-
-- **`WindowInfo` type duplication** — Linux and Windows both define identical structs; should be unified in `models/`
-- **Pause/Resume/Stop are log-only** — lifecycle events are recorded but don't actually pause the tracking loop (runs synchronously in `Start`)
-- **Hardcoded paths** — session directory and poll interval (3s) are hardcoded; should be configurable
-- **Windows platform path returns `None`** — the platform-agnostic `get_platform_telemetry()` on Windows always returns `None` due to type mismatch
-- **Terminal tracking is naive** — reads entire `.bash_history` file each poll; should use `tail` or inotify
-- **Empty placeholders** — `config/`, `storage/schema.rs`, `utils/`, `browser.rs` contain empty modules awaiting implementation
-- **Git unpushed commit counting** uses `HEAD...@{upstream}` which fails if no upstream is configured
-
-### Extension Points
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `collector/linux/browser.rs` | Browser tab/URL tracking | Empty |
-| `config/settings.rs` | Runtime configuration | Empty |
-| `storage/schema.rs` | Schema versioning + migration | Empty |
-| `utils/paths.rs` | Path resolution utilities | Empty |
-| `utils/time.rs` | Time formatting utilities | Empty |
+`guardrails.py` strips judgment words: `productive`, `lazy`, `efficient`, `inefficient`, `excellent`, `bad`.
 
 ---
 
@@ -450,56 +353,19 @@ cd rust-tracker
 cargo test
 ```
 
-Test modules exist in:
-- `processing/activity.rs` — group merging, splitting, noise filtering
-- `processing/enrich.rs` — language detection, app normalization, title parsing
-- `processing/git.rs` — summary building, dev area detection, burst detection
-- `processing/terminal.rs` — command classification, workflow detection, deduplication
-
----
-
-## Future Improvements
-
-1. **Config system** — move poll interval, thresholds, and paths from hardcoded constants to TOML/YAML config
-2. **Unified `WindowInfo`** — extract shared struct into `models/` with a `TelemetryCollector` trait
-3. **Real Pause/Resume** — make lifecycle commands actually start/stop the tracking loop
-4. **Browser tracking** — implement `browser.rs` to capture active tab titles via browser extension or DBus
-5. **File-based project detection** — scan for `Cargo.toml`, `.git`, `setup.py` to validate inferred projects
-6. **Session archival** — move completed sessions to timestamped directories
-7. **Web dashboard** — local-first SPA reading JSONL directly
-8. **Export formats** — JSON, CSV, Markdown report export
-9. **Schema versioning** — implement `storage/schema.rs` for forward-compatible evolution
-10. **Plugin system** — declarative collector plugins (not dynamic linking)
-11. **Encrypted storage** — optional at-rest encryption for sensitive metadata
-12. **AI fine-tuning** — few-shot examples for more structured LLM daily summaries
-13. **Cross-platform CI** — test on Linux and Windows in CI pipeline
-
----
-
-## Contributing
-
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-**Guidelines:**
-- Maintain the "no AI in pipeline" principle — enrichment must be deterministic
-- Add tests for new processing logic
-- Keep collector calls fast and non-blocking (< 50ms)
-- Don't add scoring, productivity metrics, or judgmental output
-- Run `cargo test` before submitting
+20 tests across enrichment, activity grouping, git analysis, and terminal classification.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. No license file is present in the repository — the author should add one. The intent is inferred from standard open-source practices.
+This project is licensed under the MIT License.
 
 ---
 
-## Related
+## How to Extend
 
-- [gnomectl](https://github.com/utkrisht-thakur-2003/gnomectl) — Companion tool for Linux window tracking (writes `activewindow.json`)
-- [Ollama](https://ollama.ai) — Local LLM runtime for AI summaries
+1. **New collector**: create in `collector/{platform}/{source}.rs`, add to module, wire in `main.rs`
+2. **New config field**: add field to `config/settings.rs`, default value function, env override in `config/mod.rs`
+3. **New enrichment field**: add to `EnrichedEvent` in `models/enriched.rs`, extraction in `processing/enrich.rs`
+4. **New workflow type**: add variant to `TerminalWorkflow` enum, base commands to `classify_command`

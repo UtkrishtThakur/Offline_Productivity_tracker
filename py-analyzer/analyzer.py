@@ -1,8 +1,10 @@
 import os
-import ollama
+import sys
 
+import ollama
 from dotenv import load_dotenv
 
+from config import AnalyzerConfig
 from formatter import build_ai_context
 from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 from guardrails import sanitize_output
@@ -11,23 +13,17 @@ from daily_writer import write_summary
 
 load_dotenv()
 
-MODEL = os.getenv("MODEL")
 
-
-def generate_summary(data):
+def generate_summary(data, cfg):
     prompt = USER_PROMPT_TEMPLATE.format(data=data)
 
-    response = ollama.chat(
-        model=MODEL,
+    ollama_client = ollama.Client(host=cfg.ollama_host)
+
+    response = ollama_client.chat(
+        model=cfg.model,
         messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
         ]
     )
 
@@ -35,24 +31,27 @@ def generate_summary(data):
 
 
 def main():
-    context = build_ai_context()
+    cfg = AnalyzerConfig()
+
+    if not cfg.enabled:
+        print("AI analyzer is disabled (TRACKER_AI_ENABLED=false).")
+        return
+
+    context = build_ai_context(cfg)
 
     if not context:
         print("\nNo activity data found.\n")
         return
 
-    print("\nGenerating summary...\n")
+    print(f"\nGenerating summary (model={cfg.model}, host={cfg.ollama_host})...\n")
 
-    summary = generate_summary(context)
-
+    summary = generate_summary(context, cfg)
     summary = sanitize_output(summary)
-
-    output_file = write_summary(summary)
+    output_file = write_summary(summary, cfg)
 
     print("\n====================================")
     print(summary)
     print("====================================")
-
     print(f"\nSummary written to: {output_file}\n")
 
 

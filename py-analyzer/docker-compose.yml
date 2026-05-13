@@ -1,14 +1,22 @@
 services:
   analyzer:
     build: .
-
     container_name: tracker-ai
-
     network_mode: "host"
 
     volumes:
+      # Mount sessions so the container can read normalized_sessions.jsonl
       - ../sessions:/sessions
+      # Mount output directory for AI summaries
       - ./outputs:/app/outputs
+
+    environment:
+      # Docker uses absolute paths — these override the local defaults
+      - TRACKER_SESSION_DIR=/sessions/active_session
+      - TRACKER_NORMALIZED_FILE=normalized_sessions.jsonl
+      - TRACKER_AI_OUTPUT_DIR=/app/outputs
+      - TRACKER_AI_ENABLED=true
+      # TRACKER_AI_OLLAMA_HOST and TRACKER_AI_MODEL come from .env
 
     env_file:
       - .env

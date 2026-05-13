@@ -1,33 +1,14 @@
-// processing/activity.rs
-//
-// Activity grouping layer.
-// Merges related enriched events into ActivityGroup structs
-// grouped by (project, app) with time-adjacency rules.
-
 use chrono::Local;
 
+use crate::config::TrackingConfig;
 use crate::models::activity::{ActivityGroup, GitSummary};
 use crate::models::enriched::EnrichedEvent;
 
-/// Maximum gap (in seconds) between events before
-/// a new activity group is started.
-const ADJACENCY_WINDOW_SEC: u64 = 300; // 5 minutes
-
-/// Minimum duration (in seconds) for a window event
-/// to be considered meaningful.
-const MIN_MEANINGFUL_SEC: u64 = 2;
-
-/// Key used for grouping activities.
-#[derive(Debug, Clone, PartialEq)]
-struct GroupKey {
-    project: Option<String>,
-    app: String,
-}
-
-/// Stateful grouper that accumulates events into ActivityGroups.
+/// Stateful grouper that accumulates enriched events into ActivityGroups.
 pub struct ActivityGrouper {
+    adjacency_window_sec: u64,
+    min_meaningful_sec: u64,
 
-    /// The currently-building activity group
     current_key: Option<GroupKey>,
     current_start: String,
     current_duration: u64,
@@ -36,14 +17,20 @@ pub struct ActivityGrouper {
     current_terminal_workflows: Vec<String>,
     current_git: Option<GitSummary>,
 
-    /// Completed groups ready for flushing
     completed: Vec<ActivityGroup>,
 }
 
-impl ActivityGrouper {
+#[derive(Debug, Clone, PartialEq)]
+struct GroupKey {
+    project: Option<String>,
+    app: String,
+}
 
-    pub fn new() -> Self {
+impl ActivityGrouper {
+    pub fn new(config: &TrackingConfig) -> Self {
         Self {
+            adjacency_window_sec: config.adjacency_window_sec,
+            min_meaningful_sec: config.min_meaningful_sec,
             current_key: None,
             current_start: String::new(),
             current_duration: 0,
@@ -55,16 +42,10 @@ impl ActivityGrouper {
         }
     }
 
-    /// Push an enriched window event into the grouper.
-    pub fn push_enriched(
-        &mut self,
-        enriched: &EnrichedEvent,
-    ) {
-        let duration = enriched.event.duration_sec
-            .unwrap_or(0);
+    pub fn push_enriched(&mut self, enriched: &EnrichedEvent) {
+        let duration = enriched.event.duration_sec.unwrap_or(0);
 
-        // Filter noise
-        if duration < MIN_MEANINGFUL_SEC {
+        if duration < self.min_meaningful_sec {
             return;
         }
 
@@ -73,12 +54,8 @@ impl ActivityGrouper {
             app: enriched.normalized_app.clone(),
         };
 
-        // Check if this belongs to the current group
         if let Some(ref current) = self.current_key {
-            if *current == key
-                && duration < ADJACENCY_WINDOW_SEC
-            {
-                // Extend current group
+            if *current == key && duration < self.adjacency_window_sec {
                 self.current_duration += duration;
 
                 if let Some(ref f) = enriched.file {
@@ -96,61 +73,43 @@ impl ActivityGrouper {
                 return;
             }
 
-            // Different key — finalize current group
             self.finalize_current();
         }
 
-        // Start new group
         self.current_key = Some(key);
         self.current_start = enriched.event.timestamp.clone();
         self.current_duration = duration;
 
-        self.current_files = enriched.file
+        self.current_files = enriched
+            .file
             .as_ref()
             .map(|f| vec![f.clone()])
             .unwrap_or_default();
 
-        self.current_languages = enriched.language
+        self.current_languages = enriched
+            .language
             .as_ref()
             .map(|l| vec![l.clone()])
             .unwrap_or_default();
     }
 
-    /// Push a terminal workflow label.
-    pub fn push_terminal_workflow(
-        &mut self,
-        workflow: &str,
-    ) {
-        if !self.current_terminal_workflows.contains(
-            &workflow.to_string()
-        ) {
-            self.current_terminal_workflows
-                .push(workflow.to_string());
+    pub fn push_terminal_workflow(&mut self, workflow: &str) {
+        if !self.current_terminal_workflows.contains(&workflow.to_string()) {
+            self.current_terminal_workflows.push(workflow.to_string());
         }
     }
 
-    /// Push git summary data.
-    pub fn push_git(
-        &mut self,
-        summary: GitSummary,
-    ) {
+    pub fn push_git(&mut self, summary: GitSummary) {
         self.current_git = Some(summary);
     }
 
-    /// Split on idle — finalizes the current group
-    /// so the next event starts a fresh one.
     pub fn split_on_idle(&mut self) {
         self.finalize_current();
     }
 
-    /// Finalize the current in-progress group and
-    /// move it to the completed list.
     fn finalize_current(&mut self) {
-
         if let Some(ref key) = self.current_key {
-
             if self.current_duration == 0 {
-                // Nothing meaningful accumulated
                 self.reset_current();
                 return;
             }
@@ -163,8 +122,7 @@ impl ActivityGrouper {
                 total_duration_sec: self.current_duration,
                 files_touched: self.current_files.clone(),
                 languages: self.current_languages.clone(),
-                terminal_workflows:
-                    self.current_terminal_workflows.clone(),
+                terminal_workflows: self.current_terminal_workflows.clone(),
                 git_summary: self.current_git.clone(),
             };
 
@@ -174,7 +132,6 @@ impl ActivityGrouper {
         self.reset_current();
     }
 
-    /// Reset current group state.
     fn reset_current(&mut self) {
         self.current_key = None;
         self.current_start.clear();
@@ -185,18 +142,11 @@ impl ActivityGrouper {
         self.current_git = None;
     }
 
-    /// Drain all completed groups.
-    /// Call this to get finalized groups for persistence.
-    pub fn drain_completed(
-        &mut self,
-    ) -> Vec<ActivityGroup> {
+    pub fn drain_completed(&mut self) -> Vec<ActivityGroup> {
         std::mem::take(&mut self.completed)
     }
 
-    /// Finalize everything (current + completed) and return all groups.
-    pub fn finalize_all(
-        &mut self,
-    ) -> Vec<ActivityGroup> {
+    pub fn finalize_all(&mut self) -> Vec<ActivityGroup> {
         self.finalize_current();
         std::mem::take(&mut self.completed)
     }
@@ -207,6 +157,14 @@ mod tests {
     use super::*;
     use crate::models::event::Event;
     use serde_json::json;
+
+    fn test_config() -> TrackingConfig {
+        TrackingConfig {
+            adjacency_window_sec: 300,
+            min_meaningful_sec: 2,
+            ..Default::default()
+        }
+    }
 
     fn make_enriched(
         app: &str,
@@ -237,17 +195,10 @@ mod tests {
 
     #[test]
     fn test_merge_same_project() {
-        let mut grouper = ActivityGrouper::new();
+        let mut grouper = ActivityGrouper::new(&test_config());
 
-        let e1 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("main.rs"), Some("rust"), 60,
-        );
-
-        let e2 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("manager.rs"), Some("rust"), 120,
-        );
+        let e1 = make_enriched("antigravity", Some("tracker"), Some("main.rs"), Some("rust"), 60);
+        let e2 = make_enriched("antigravity", Some("tracker"), Some("manager.rs"), Some("rust"), 120);
 
         grouper.push_enriched(&e1);
         grouper.push_enriched(&e2);
@@ -261,17 +212,10 @@ mod tests {
 
     #[test]
     fn test_split_different_project() {
-        let mut grouper = ActivityGrouper::new();
+        let mut grouper = ActivityGrouper::new(&test_config());
 
-        let e1 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("main.rs"), Some("rust"), 60,
-        );
-
-        let e2 = make_enriched(
-            "antigravity", Some("other-project"),
-            Some("app.py"), Some("python"), 30,
-        );
+        let e1 = make_enriched("antigravity", Some("tracker"), Some("main.rs"), Some("rust"), 60);
+        let e2 = make_enriched("antigravity", Some("other-project"), Some("app.py"), Some("python"), 30);
 
         grouper.push_enriched(&e1);
         grouper.push_enriched(&e2);
@@ -283,20 +227,14 @@ mod tests {
 
     #[test]
     fn test_idle_split() {
-        let mut grouper = ActivityGrouper::new();
+        let mut grouper = ActivityGrouper::new(&test_config());
 
-        let e1 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("main.rs"), Some("rust"), 60,
-        );
+        let e1 = make_enriched("antigravity", Some("tracker"), Some("main.rs"), Some("rust"), 60);
 
         grouper.push_enriched(&e1);
         grouper.split_on_idle();
 
-        let e2 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("main.rs"), Some("rust"), 30,
-        );
+        let e2 = make_enriched("antigravity", Some("tracker"), Some("main.rs"), Some("rust"), 30);
 
         grouper.push_enriched(&e2);
 
@@ -307,13 +245,9 @@ mod tests {
 
     #[test]
     fn test_noise_filtered() {
-        let mut grouper = ActivityGrouper::new();
+        let mut grouper = ActivityGrouper::new(&test_config());
 
-        // 1-second event should be filtered
-        let e1 = make_enriched(
-            "antigravity", Some("tracker"),
-            Some("main.rs"), Some("rust"), 1,
-        );
+        let e1 = make_enriched("antigravity", Some("tracker"), Some("main.rs"), Some("rust"), 1);
 
         grouper.push_enriched(&e1);
 

@@ -2,7 +2,7 @@
 
 **Project:** `rust-tracker` — Local-first deterministic desktop telemetry and activity reconstruction engine.  
 **Location:** `/mnt/ai/Projects/tracker` (workspace root), `rust-tracker/` (Rust project root)  
-**License/Maturity:** Very early stage — working prototype with empty placeholder modules.
+**License/Maturity:** Early stage — working prototype with centralized configuration.
 
 ---
 
@@ -20,6 +20,12 @@
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
+│                     config/mod.rs + settings.rs                     │
+│               tracker.toml loading & env overrides                  │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │ AppContext
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
 │                          main.rs                                   │
 │                   Orchestration & Loop                             │
 └──────┬──────────┬──────────┬──────────┬───────────┬──────────────┘
@@ -32,10 +38,10 @@
      │           │          │          │
      ▼           ▼          ▼          ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│                        SessionManager                             │
+│                        SessionManager                              │
 │              (session/manager.rs)                                  │
 │                                                                     │
-│  Owns: ActivityGrouper, last_event buffer                          │
+│  Owns: ActivityGrouper, Logger, last_event buffer                  │
 │  Merges consecutive identical windows                              │
 │  Routes events → enrichment → grouper                             │
 │  Handles idle boundaries                                           │
@@ -58,17 +64,17 @@
 │              (processing/activity.rs)                              │
 │                                                                     │
 │  Groups by (project, app) key                                      │
-│  5-minute adjacency window                                         │
+│  Configurable adjacency window                                     │
 │  Idle splits flush groups                                          │
 │  Pushes completed ActivityGroup to storage                         │
 └──────┬─────────────────────────────────────────────────────────────┘
        │
        ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│                      Storage Layer                                 │
+│                      Storage Layer (Logger struct)                  │
 │              (storage/logger.rs)                                   │
 │                                                                     │
-│  ../sessions/active_session/                                       │
+│  Configurable session_dir, events_file, normalized_file            │
 │    ├── events.jsonl              (raw Event lines)                 │
 │    └── normalized_sessions.jsonl  (ActivityGroup lines)            │
 │                                                                     │
@@ -87,70 +93,130 @@
 
 ---
 
+## Config System (`config/`)
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `config/mod.rs` | `AppContext`, config loader, env override logic, `write_default()`, `ConfigError` |
+| `config/settings.rs` | Typed structs: `TrackerConfig`, `TrackingConfig`, `StorageConfig`, `AiAnalyzerConfig`, `LoggingConfig` |
+
+### Config resolution order
+
+1. **CLI `--config` flag** — explicit path, must exist or errors
+2. **`TRACKER_CONFIG`** env var — explicit path
+3. **`./tracker.toml`** — current working directory
+4. **Platform config dir** — `~/.config/tracker/tracker.toml` (Linux) or `%APPDATA%/tracker/tracker.toml` (Windows)
+5. **Built-in defaults** — no file required, all values have sane defaults
+
+### Environment variable overrides
+
+Every config field can be overridden at runtime via `TRACKER_*` env variables:
+
+| Env var | Config field | Example |
+|---------|-------------|---------|
+| `TRACKER_POLL_INTERVAL_SEC` | `tracking.poll_interval_sec` | `5` |
+| `TRACKER_IDLE_THRESHOLD_SEC` | `tracking.idle_threshold_sec` | `180` |
+| `TRACKER_ADJACENCY_WINDOW_SEC` | `tracking.adjacency_window_sec` | `600` |
+| `TRACKER_SESSION_DIR` | `storage.session_dir` | `/data/sessions` |
+| `TRACKER_EVENTS_FILE` | `storage.events_file` | `raw.jsonl` |
+| `TRACKER_NORMALIZED_FILE` | `storage.normalized_file` | `sessions.jsonl` |
+| `TRACKER_AI_ENABLED` | `ai_analyzer.enabled` | `true` |
+| `TRACKER_AI_OLLAMA_HOST` | `ai_analyzer.ollama_host` | `http://10.0.0.1:11434` |
+| `TRACKER_AI_MODEL` | `ai_analyzer.model` | `llama3` |
+| `TRACKER_AI_OUTPUT_DIR` | `ai_analyzer.output_dir` | `./summaries` |
+| `TRACKER_LOG_LEVEL` | `logging.log_level` | `debug` |
+
+### Config file format (TOML)
+
+See `tracker.toml` at workspace root for the authoritative reference.
+
+### Default config generation
+
+```bash
+tracker init-config
+# Writes tracker.toml to CWD with all defaults and documentation
+```
+
+### `AppContext`
+
+Holds the parsed `TrackerConfig` and config path. Created once at startup:
+
+```rust
+let ctx = config::AppContext::load(cli.config.as_deref())?;
+// Access:
+ctx.config.tracking.poll_interval_sec
+ctx.config.storage.session_dir
+ctx.config.ai_analyzer.enabled
+```
+
+---
+
 ## Runtime Flow
 
 ### Tracking Loop (`main.rs:run_tracking_loop`)
 
-Polls every **3 seconds** (hardcoded). Collects four telemetry sources in parallel:
+Polls every `tracking.poll_interval_sec` (default 3s). All thresholds read from config:
 
 ```
-loop (every 3s):
+loop (every poll_interval_sec):
     1. Window info         (get_active_window)
     2. Idle time           (get_idle_ms)
     3. Terminal command    (get_latest_command)
     4. Git activity        (get_git_activity)
 
     ├── IDLE CHECK ─────────────────────────────────────────
-    │   if idle >= 120s (IDLE_THRESHOLD_SEC):
+    │   if idle >= idle_threshold_sec (default 120):
     │       1. Flush current window session (with elapsed duration)
     │       2. manager.emit_idle(idle_sec)
     │          ├── logs idle_session event
     │          └── grouper.split_on_idle() — finalizes current group
-    │       3. Sleep 2s, continue (skip other polling)
+    │       3. Sleep idle_sleep_sec (default 2s), continue
     │
     ├── WINDOW TRACKING ────────────────────────────────────
     │   On window change (app::title differs from last):
-    │       1. manager.process_window_session(app, title, workspace, elapsed_sec)
-    │          ├── if duration < 2s: ignore (noise filter)
+    │       1. manager.process_window_session(...)
+    │          ├── if duration < min_meaningful_sec (default 2s): ignore
     │          ├── if matches last_event: merge (extend duration)
     │          └── else:
     │              1. flush old last_event
-    │                 ├── log_event (raw JSONL)
-    │                 └── enrich_event → grouper.push_enriched
     │              2. create new last_event
     │
     ├── TERMINAL TRACKING ──────────────────────────────────
-    │   On new command (differs from last):
+    │   On new command:
     │       1. classify_command(cmd) → TerminalWorkflow enum
-    │       2. log_event("terminal_command", ...)
+    │       2. logger.log_event("terminal_command", ...)
     │       3. manager.push_terminal_workflow(workflow.label())
     │
     ├── GIT TRACKING ───────────────────────────────────────
     │   On git state change:
-    │       1. log_event("git_activity", ...)
+    │       1. logger.log_event("git_activity", ...)
     │       2. build_git_summary(&json) → Option<GitSummary>
     │       3. manager.push_git_summary(summary)
     │
-    └── sleep(3s)
+    └── sleep(poll_interval_sec)
 
 On Ctrl+C:
     manager.finalize()
         ├── flush() — flush pending last_event
         ├── grouper.finalize_all() — finalize current + drain completed
-        └── log_normalized_session for each group
+        └── logger.log_normalized_session() for each group
 ```
 
 ### CLI Commands (`cli/commands.rs`)
 
 | Command | Behavior |
 |---------|----------|
-| `tracker Start` | Logs `tracker_started` event, enters tracking loop |
-| `tracker Pause` | Logs `tracker_paused` event |
-| `tracker Resume` | Logs `tracker_resumed` event |
-| `tracker Stop` | Logs `tracker_stopped` event |
-| `tracker Report` | Reads `normalized_sessions.jsonl` → `format_report()` → stdout |
+| `tracker [--config PATH] Start` | Logs `tracker_started`, enters tracking loop |
+| `tracker [--config PATH] Pause` | Logs `tracker_paused` event |
+| `tracker [--config PATH] Resume` | Logs `tracker_resumed` event |
+| `tracker [--config PATH] Stop` | Logs `tracker_stopped` event |
+| `tracker [--config PATH] Report` | Reads `normalized_sessions.jsonl` → `format_report()` → stdout |
+| `tracker [--config PATH] ReportAi` | Invokes `py-analyzer/analyzer.py` subprocess (if `ai_analyzer.enabled`) |
+| `tracker InitConfig` | Writes default `tracker.toml` to CWD |
 
-Note: Pause/Resume/Stop currently only log events — they don't actually pause/stop the running loop (the loop runs synchronously in `Start`). This is an intended extension point.
+Note: Pause/Resume/Stop currently only log events — they don't actually pause/stop the running loop. This is an intended extension point.
 
 ---
 
@@ -161,13 +227,13 @@ Note: Pause/Resume/Stop currently only log events — they don't actually pause/
 ```rust
 pub struct Event {
     pub timestamp: String,        // RFC 3339
-    pub event_type: String,       // "window_session" | "terminal_command" | "git_activity" | "idle_session" | "tracker_started" | ...
-    pub source: String,           // "window_tracker" | "terminal_tracker" | "git_tracker" | "idle_tracker" | "system"
+    pub event_type: String,       // "window_session" | "terminal_command" | "git_activity" | ...
+    pub source: String,           // "window_tracker" | "terminal_tracker" | ...
     pub app: Option<String>,      // raw window application name
     pub title: Option<String>,    // raw window title
     pub workspace: Option<i64>,   // workspace/desktop number
     pub duration_sec: Option<u64>,// time spent on this event
-    pub data: Value,              // arbitrary JSON payload (git data, command text, etc.)
+    pub data: Value,              // arbitrary JSON payload
 }
 ```
 
@@ -176,13 +242,13 @@ pub struct Event {
 ```rust
 pub struct EnrichedEvent {
     #[serde(flatten)]
-    pub event: Event,             // the original event (fields merged at top level)
-    pub project: Option<String>,  // determined from window title parsing
-    pub file: Option<String>,     // active file from window title
-    pub language: Option<String>, // mapped from file extension
-    pub normalized_app: String,   // canonical app name (e.g. "vscode" not "Code - OSS")
-    pub repo: Option<String>,     // extracted from event data
-    pub branch: Option<String>,   // extracted from event data
+    pub event: Event,
+    pub project: Option<String>,
+    pub file: Option<String>,
+    pub language: Option<String>,
+    pub normalized_app: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
 }
 ```
 
@@ -194,8 +260,8 @@ pub struct GitSummary {
     pub branch: String,
     pub commit_count: u32,
     pub unpushed: u32,
-    pub changed_files: Vec<String>,  // git porcelain format entries
-    pub dev_areas: Vec<String>,      // parent directories of changed files
+    pub changed_files: Vec<String>,
+    pub dev_areas: Vec<String>,
 }
 ```
 
@@ -203,14 +269,14 @@ pub struct GitSummary {
 
 ```rust
 pub struct ActivityGroup {
-    pub start_time: String,              // RFC 3339 of first event in group
-    pub end_time: String,                // RFC 3339 when group was finalized
+    pub start_time: String,
+    pub end_time: String,
     pub project: Option<String>,
-    pub app: String,                     // normalized app name
-    pub total_duration_sec: u64,         // sum of constituent event durations
-    pub files_touched: Vec<String>,      // deduplicated
-    pub languages: Vec<String>,          // deduplicated
-    pub terminal_workflows: Vec<String>, // deduplicated workflow labels
+    pub app: String,
+    pub total_duration_sec: u64,
+    pub files_touched: Vec<String>,
+    pub languages: Vec<String>,
+    pub terminal_workflows: Vec<String>,
     pub git_summary: Option<GitSummary>,
 }
 ```
@@ -219,7 +285,7 @@ pub struct ActivityGroup {
 
 ## Normalization Pipeline (raw window title → structured context)
 
-The enrichment system in `processing/enrich.rs` converts raw telemetry into structured, deterministic context through three parallel transforms:
+The enrichment system in `processing/enrich.rs` converts raw telemetry into structured, deterministic context:
 
 ### 1. Title Parsing (project & file extraction)
 
@@ -237,37 +303,13 @@ Algorithm:
   4. Return (project, file)
 ```
 
-The `looks_like_file()` function requires:
-- A dot character (`.`) in the segment
-- An extension of 1–10 characters after the dot
-- The extension must appear in `LANGUAGE_MAP`
-
 ### 2. Language Detection
 
-```
-Filename: "main.rs"
-            │  │
-            │  └── extension → lookup in LANGUAGE_MAP
-            │                   (55 entries: rs→rust, py→python, ...)
-            └── result: "rust"
-```
-
-Pure linear scan over a static slice. O(n) but trivially fast for 55 entries.
+Pure linear scan over static `LANGUAGE_MAP` slice (44 entries). O(n) but trivially fast.
 
 ### 3. App Name Normalization
 
-```
-Raw: "Code - OSS"  →  exact match: "vscode"
-Raw: "firefox"     →  exact match: "firefox"
-Raw: "unknown"     →  fallback: lowercase + trim → "unknown"
-```
-
-Two-pass strategy:
-1. **Exact match** against `APP_NAME_MAP` (38 entries)
-2. **Case-insensitive substring match** against normalized keys
-3. **Fallback** — lowercase + trim the raw string
-
-Design rationale: app names vary across OS versions, distributions, and installations. Substring matching catches variants like "Firefox ESR", "Google Chrome", "firefox-developer-edition" without needing exhaustive enumeration.
+Two-pass: exact match → case-insensitive substring match → lowercase fallback. Covers variants like "Firefox ESR", "Google Chrome", "firefox-developer-edition".
 
 ---
 
@@ -279,44 +321,27 @@ Design rationale: app names vary across OS versions, distributions, and installa
 GroupKey = (project: Option<String>, app: String)
 ```
 
-Every enriched event is bucketed by this key. When the key changes, the current group is finalized.
+### Adjacency Window (configurable, default 300s / 5 minutes)
 
-### Adjacency Window (300 seconds / 5 minutes)
-
-If an enriched event matches the current `GroupKey` AND its duration is less than `ADJACENCY_WINDOW_SEC`, it's **merged** into the current group:
-
+Events matching the current `GroupKey` with duration < `adjacency_window_sec` are merged:
 - `total_duration_sec` accumulates
-- `files_touched` gets deduplicated append
-- `languages` gets deduplicated append
-
-If duration exceeds `ADJACENCY_WINDOW_SEC` (theoretical — in practice a single poll is 3s), the group is finalized and a new one starts.
+- `files_touched` deduplicated append
+- `languages` deduplicated append
 
 ### Idle Splitting
 
 ```
-manager.emit_idle(120)  →  grouper.split_on_idle()
-                                  │
-                                  └── finalize_current()
-                                        │
-                                        └── if duration > 0:
-                                              push ActivityGroup to completed
-
+manager.emit_idle(n)  →  grouper.split_on_idle()
+                              └── finalize_current()
+                                    └── if duration > 0: push to completed
 next event → fresh group
 ```
 
-This ensures that periods of activity separated by >= 2 minutes of idle produce distinct `ActivityGroup` records.
-
 ### Terminal & Git Side-Channels
 
-Terminal workflows and git summaries are **not grouped by window focus** — they are injected into the *current* group via:
-- `grouper.push_terminal_workflow(label)` — deduplicated ordered list
-- `grouper.push_git(GitSummary)` — replaces previous (latest state wins)
-
-This means the grouper produces: `ActivityGroup { ..., terminal_workflows: ["Rust build workflow", "Git commit workflow"], git_summary: Some(...), }`
-
-### Deterministic Guarantee
-
-Given the same sequence of raw events, the grouping algorithm always produces the same `Vec<ActivityGroup>`. No randomness, no ML, no external state.
+Injected into the *current* group via:
+- `grouper.push_terminal_workflow(label)` — deduplicated
+- `grouper.push_git(GitSummary)` — latest state wins
 
 ---
 
@@ -324,33 +349,29 @@ Given the same sequence of raw events, the grouping algorithm always produces th
 
 ### Linux (`collector/linux/`)
 
-| Collector | Source | Returns | Notes |
-|-----------|--------|---------|-------|
-| `window.rs` | `~/.config/gnomectl/activewindow.json` | `WindowInfo { app, title, workspace }` | Depends on `gnomectl` being installed; reads a JSON file written by a companion tool |
-| `idle.rs` | `xprintidle` command | `Option<u64>` (milliseconds) | Depends on `xprintidle` being installed |
-| `terminal.rs` | `~/.bash_history` | `Option<String>` (last command) | Reads entire file, takes last line; naive approach for now |
-| `git.rs` | `git` commands in CWD | `Option<Value>` (JSON) | Runs `git rev-parse --show-toplevel`, `git rev-parse --abbrev-ref HEAD`, `git status --porcelain`, `git log -1`, `git cherry -v` |
-| `browser.rs` | — | — | Placeholder (empty) |
+| Collector | Source | Returns |
+|-----------|--------|---------|
+| `window.rs` | `~/.config/gnomectl/activewindow.json` | `WindowInfo { app, title, workspace }` |
+| `idle.rs` | `xprintidle` command | `Option<u64>` (milliseconds) |
+| `terminal.rs` | `~/.bash_history` | `Option<String>` (last command) |
+| `git.rs` | `git` commands in CWD | `Option<Value>` (JSON) |
+| `browser.rs` | — | Placeholder |
 
 ### Windows (`collector/windows/`)
 
 | Collector | Source | Status |
 |-----------|--------|--------|
-| `window.rs` | Win32 `GetForegroundWindow` + `GetWindowText` + `GetWindowThreadProcessId` | Implemented but returns `None` in platform-agnostic path |
+| `window.rs` | Win32 `GetForegroundWindow` + `GetWindowText` + `GetWindowThreadProcessId` | Implemented |
 | `idle.rs` | Win32 `GetLastInputInfo` | Implemented |
-| `terminal.rs` | PowerShell history file | Implemented |
+| `terminal.rs` | PowerShell history | Implemented |
 | `git.rs` | `git status --porcelain` | Implemented |
-| `browser.rs` | — | Stub (`// Unimplemented`) |
-
-### Platform Selection (`main.rs:get_platform_telemetry`)
-
-Uses `#[cfg(target_os = "linux")]` and `#[cfg(target_os = "windows")]` for compile-time platform selection. Currently the platform-agnostic path only works on Linux (Windows path returns all `None` due to `WindowInfo` type mismatch).
+| `browser.rs` | — | Stub |
 
 ---
 
 ## Terminal Workflow Classification (`processing/terminal.rs`)
 
-Pure prefix matching against the base command (first whitespace-delimited token):
+Pure prefix matching against base command token:
 
 | Workflow | Matching Commands |
 |----------|------------------|
@@ -363,21 +384,17 @@ Pure prefix matching against the base command (first whitespace-delimited token)
 | `SystemAdmin` | sudo, systemctl, journalctl, apt, pacman, dnf, yum, brew, snap, flatpak, chmod, chown, kill, ps, top, htop, df, du, mount, umount, ssh, scp |
 | `Unknown` | everything else |
 
-`detect_workflows()` also deduplicates consecutive same-type commands (similar to `uniq`).
-
 ---
 
 ## Git Reconstruction (`processing/git.rs`)
 
-### `build_git_summary`
-
-Expects JSON shape from the git collector:
+`build_git_summary()` expects JSON shape from git collector:
 
 ```json
 {
   "repo": "/mnt/ai/Projects/tracker",
   "branch": "main",
-  "changed_files": ["M src/main.rs", "M src/session/manager.rs"],
+  "changed_files": ["M src/main.rs"],
   "changed_count": 2,
   "last_commit_hash": "abc123",
   "last_commit_message": "message",
@@ -385,73 +402,91 @@ Expects JSON shape from the git collector:
 }
 ```
 
-### `detect_dev_areas`
-
-Parses git porcelain format lines:
-```
-"M src/main.rs"  →  split on whitespace, take last  →  "src/main.rs"
-                                                  →  parent directory  →  "src"
-```
-
-Produces deduplicated list of directories being actively edited. Root-level files produce no dev area entry.
+`detect_dev_areas()` extracts parent directories from git porcelain-format file paths.
 
 ---
 
 ## Storage Layer (`storage/logger.rs`)
 
-### File Layout
+### Logger struct
 
+```rust
+pub struct Logger {
+    pub session_dir: PathBuf,
+    pub events_path: PathBuf,
+    pub normalized_path: PathBuf,
+}
 ```
-../sessions/
-└── active_session/
-    ├── events.jsonl               ← Raw Event structs, one JSON object per line
-    └── normalized_sessions.jsonl  ← ActivityGroup structs, one JSON object per line
-```
 
-### Write Strategy
+Created from `StorageConfig`. All paths are configurable via `tracker.toml` or env vars.
 
-- `log_event()`: Serializes `Event` to JSON, appends to `events.jsonl`. Called for every telemetry data point.
-- `log_normalized_session()`: Serializes `ActivityGroup` to JSON, appends to `normalized_sessions.jsonl`. Called when groups are completed (idle flush, finalize).
+### Methods
 
-### Read Strategy
-
-- `read_normalized_sessions()`: Reads entire `normalized_sessions.jsonl`, deserializes each line. Returns `Vec<ActivityGroup>`. Returns empty vec if file doesn't exist.
-
-### Path Convention
-
-Path is hardcoded as `../sessions/active_session` (relative to the Rust binary, i.e. `rust-tracker/../sessions/active_session` = `sessions/active_session` at workspace root). `fs::create_dir_all` ensures directory exists before every write.
+- `log_event()` — serialize `Event` to JSON, append to `events.jsonl`
+- `log_normalized_session()` — serialize `ActivityGroup` to JSON, append to `normalized_sessions.jsonl`
+- `read_normalized_sessions()` — read and deserialize all lines from `normalized_sessions.jsonl`
 
 ---
 
-## Report Layer (`processing/summary.rs`)
+## AI Analyzer Integration (`py-analyzer/`)
 
-Formats `ActivityGroup` into a human-readable block:
+### Flow
 
 ```
---- Activity Reconstruction Report ---
-
-Used vscode in:
-tracker
-
-Worked on:
-- main.rs
-- manager.rs
-
-Time spent:
-3 minutes, 15 seconds
-
-Terminal activity:
-- Rust build workflow
-- Git commit workflow
-
-Git activity:
-- 2 commits
-- Development areas: src, src/session
-
----
+normalized_sessions.jsonl
+         │
+         ▼
+  formatter.py ─── build_ai_context(cfg)
+         │          aggregates by project
+         ▼
+  prompts.py ───── SYSTEM_PROMPT + USER_PROMPT_TEMPLATE
+         ▼
+  analyzer.py ──── ollama.chat(model, messages)
+         │
+         ▼
+  guardrails.py ── sanitize_output() — strips banned judgment words
+         │
+         ▼
+  daily_writer.py ── write_summary(text, cfg) → outputs/{date}.txt
 ```
 
-The format is intentionally neutral — factual reconstruction, no scores, no efficiency metrics, no judgment.
+### Configuration
+
+The Python analyzer reads from environment variables (same `TRACKER_AI_*` prefix as Rust):
+
+| Python config field | Env var | Default |
+|--------------------|---------|---------|
+| `normalized_log` | `TRACKER_NORMALIZED_LOG` / `NORMALIZED_LOG` | `../sessions/active_session/normalized_sessions.jsonl` |
+| `output_dir` | `TRACKER_AI_OUTPUT_DIR` / `OUTPUT_DIR` | `outputs` |
+| `ollama_host` | `TRACKER_AI_OLLAMA_HOST` / `OLLAMA_HOST` | `http://localhost:11434` |
+| `model` | `TRACKER_AI_MODEL` / `MODEL` | `qwen2.5:7b` |
+| `enabled` | `TRACKER_AI_ENABLED` / `AI_ENABLED` | `true` |
+
+### Feature Toggle
+
+In `tracker.toml`:
+```toml
+[ai_analyzer]
+enabled = false   # tracker works fully without Python/AI
+```
+
+When disabled:
+- `tracker report-ai` exits with a message
+- `tracker report` shows a note that AI is disabled
+- The Rust tracking loop is completely unaffected
+
+When enabled:
+- `tracker report-ai` runs `py-analyzer/analyzer.py` as a subprocess
+- Config values (model, host, paths) are forwarded as env vars
+
+### Docker
+
+```bash
+cd py-analyzer
+docker compose up -d
+```
+
+The container mounts `../sessions:/sessions` and reads `TRACKER_SESSION_DIR=/sessions/active_session`. Ollama runs on the host via `network_mode: "host"`.
 
 ---
 
@@ -459,18 +494,21 @@ The format is intentionally neutral — factual reconstruction, no scores, no ef
 
 ```
 main.rs
-  ├── cli::commands       (CLI argument parsing — no deps on rest)
-  ├── collector::linux::* (OS telemetry — no deps on other modules)
-  ├── session::manager    (depends on: models, processing, storage)
-  │     ├── models::event
-  │     ├── models::activity
-  │     ├── processing::activity  (ActivityGrouper)
+  ├── config              (settings + mod — loaded first)
+  │     ├── settings.rs   (TrackerConfig structs)
+  │     └── mod.rs        (AppContext, loader, env overrides)
+  ├── cli::commands       (CLI argument parsing)
+  ├── collector::linux::* (OS telemetry)
+  ├── session::manager    (depends on: config, models, processing, storage::logger)
+  │     ├── config::TrackerConfig
+  │     ├── models::event, models::activity
+  │     ├── processing::activity  (ActivityGrouper, config-aware)
   │     ├── processing::enrich    (enrich_event)
-  │     └── storage::logger       (log_event, log_normalized_session)
+  │     └── storage::logger       (Logger struct)
   ├── processing::git     (depends on: models::activity)
   ├── processing::terminal (no deps)
   ├── processing::summary  (depends on: models::activity)
-  └── storage::logger     (depends on: models)
+  └── storage::logger     (depends on: config::StorageConfig, models)
 ```
 
 ---
@@ -479,133 +517,93 @@ main.rs
 
 | Module | File | Status | Intended Purpose |
 |--------|------|--------|------------------|
-| `config/mod.rs` | `config/mod.rs` | Empty | Runtime configuration (poll interval, thresholds, paths) |
-| `config/settings.rs` | `config/settings.rs` | Empty | Settings structs, config file parsing |
 | `utils/paths.rs` | `utils/paths.rs` | Empty | Path resolution utilities |
 | `utils/time.rs` | `utils/time.rs` | Empty | Time formatting, duration utilities |
 | `storage/schema.rs` | `storage/schema.rs` | Empty | Schema versioning, migration support |
 | `collector/linux/browser.rs` | `collector/linux/browser.rs` | Empty | Browser tab/URL tracking |
 | `collector/windows/browser.rs` | `collector/windows/browser.rs` | Stub | Browser tab/URL tracking on Windows |
-| `py-analyzer/` (entire dir) | various `.py` | All empty | Future Python LLM analysis layer |
+
+Note: `config/` is no longer a placeholder — it's fully implemented.
 
 ---
 
-## Configuration Constants
+## Configuration Constants — Now in `tracker.toml`
 
-| Constant | Value | File | Description |
-|----------|-------|------|-------------|
-| `ADJACENCY_WINDOW_SEC` | 300 | `processing/activity.rs:14` | Max gap between merged events in a group |
-| `MIN_MEANINGFUL_SEC` | 2 | `processing/activity.rs:18` | Minimum window duration to be meaningful |
-| `IDLE_THRESHOLD_SEC` | 120 | `session/manager.rs:24` | Idle time before splitting groups |
-| Poll interval | 3s | `main.rs:219` | Main loop sleep duration |
+| Config key | Default | Description |
+|-----------|---------|-------------|
+| `tracking.poll_interval_sec` | 3 | Main loop sleep duration |
+| `tracking.idle_sleep_sec` | 2 | Sleep during idle periods |
+| `tracking.idle_threshold_sec` | 120 | Idle time before splitting groups |
+| `tracking.adjacency_window_sec` | 300 | Max gap between merged events |
+| `tracking.min_meaningful_sec` | 2 | Minimum window duration to be meaningful |
+| `storage.session_dir` | `../sessions/active_session` | Session data directory |
+| `storage.events_file` | `events.jsonl` | Raw event file name |
+| `storage.normalized_file` | `normalized_sessions.jsonl` | Normalized session file name |
+| `ai_analyzer.enabled` | `false` | Enable AI summary generation |
+| `ai_analyzer.ollama_host` | `http://localhost:11434` | Ollama API endpoint |
+| `ai_analyzer.model` | `qwen2.5:7b` | LLM model |
+| `ai_analyzer.output_dir` | `outputs` | AI summary output directory |
+| `logging.enable_file_logging` | `true` | Write log files |
+| `logging.log_level` | `info` | Log verbosity |
 
 ---
 
 ## Test Coverage
 
-Test modules exist in:
-- `processing/activity.rs:205` — ActivityGroup merging, splitting, noise filtering
-- `processing/enrich.rs:265` — Language detection, app normalization, title parsing
-- `processing/git.rs:111` — Summary building, dev area detection, commit burst detection
-- `processing/terminal.rs:137` — Command classification, workflow detection, deduplication
+Test modules in:
+- `processing/activity.rs` — ActivityGroup merging, splitting, noise filtering
+- `processing/enrich.rs` — Language detection, app normalization, title parsing
+- `processing/git.rs` — Summary building, dev area detection, commit burst detection
+- `processing/terminal.rs` — Command classification, workflow detection, deduplication
 
-Run tests from `rust-tracker/`: `cargo test`
+Run tests from `rust-tracker/`:
+```bash
+cargo test
+```
 
 ---
 
 ## Design Decisions & Rationale
 
+### Why TOML for config?
+TOML is the standard for Rust projects (used by Cargo itself). It's readable, typed, and has first-class serde support.
+
+### Why `Logger` struct instead of free functions?
+Encapsulating paths in a struct eliminates duplicated path logic, makes the config injection explicit, and enables future features like log rotation or multi-session logging.
+
+### Why env var overrides in addition to config file?
+Containerized deployments (Docker, Kubernetes) pass config through environment variables. The `TRACKER_*` prefix avoids collisions with system vars.
+
+### Why AI analyzer as a separate Python process?
+Keeps the AI dependency (Ollama, Python runtime, large models) completely optional. The Rust core is self-contained for deterministic tracking. Python is only needed for AI summaries.
+
 ### Why flat `Vec<ActivityGroup>` instead of a tree/relational model?
-Activity reconstruction is fundamentally flat — a sequence of user attention spans. Tree structures would overcomplicate the model for no gain at current scope.
+Activity reconstruction is fundamentally flat — a sequence of user attention spans.
 
 ### Why JSONL instead of SQLite/sled?
-JSONL is the simplest possible append-only durable format. It enables:
-- Trivially inspectable with `cat`, `jq`, `tail`
-- No schema migration needed
-- Easy to pipe into other tools
-- Atomic appends (no locking concerns at single-writer scale)
-
-Trade-off: no random access, no indexing. Read is O(n). Acceptable for local desktop use.
-
-### Why separate `events.jsonl` and `normalized_sessions.jsonl`?
-- `events.jsonl` is the raw audit log — every telemetry tick
-- `normalized_sessions.jsonl` is the processed view — reconstructed activity blocks
-- Both can be independently replayed or reprocessed
+Trivially inspectable with `cat`/`jq`/`tail`. No schema migration. Atomic appends. Acceptable O(n) read for local desktop use.
 
 ### Why `#[serde(flatten)]` on `EnrichedEvent.event`?
-This makes the JSON output flat (no nested "event" key), matching the expected schema for downstream consumers. The Rust type still preserves the structural relationship.
+Flat JSON output matching expected schema for downstream consumers.
 
 ### Why compile-time platform selection instead of trait objects?
-At current scale (2 platforms, <1000 LOC), `#[cfg]` is simpler and avoids dynamic dispatch overhead. If more platforms are added, a `PlatformTelemetry` trait should be extracted.
-
----
-
-## Future Roadmap
-
-### Immediate (unblocks basic usage)
-1. **Fix platform-agnostic path** — resolve `WindowInfo` type mismatch between Linux and Windows collectors
-2. **Make polling interval configurable** — move from hardcoded 3s to config
-3. **Implement Pause/Resume/Stop as real operations** — currently they only log events
-4. **Make session path configurable** — currently hardcoded relative path
-
-### Short-term
-5. **Browser integration** — implement `collector/linux/browser.rs` to capture active tab titles
-6. **Config file** — implement `config/settings.rs` for YAML/TOML config
-7. **Schema versioning** — implement `storage/schema.rs` for forward-compatible storage
-8. **Session archival** — move completed sessions out of `active_session/` into timestamped archives
-
-### Medium-term
-9. **`py-analyzer` integration** — LLM-powered semantic analysis reading normalized JSONL
-10. **Cross-platform `WindowInfo` unification** — extract a shared `WindowInfo` into `models/` and implement a `TelemetryCollector` trait
-11. **File-based project detection** — scan filesystem for project markers (Cargo.toml, .git, setup.py) to validate inferred project names
-12. **Editor-agnostic project detection** — read IDE workspace files for more accurate project boundaries
-
-### Long-term
-13. **Plugin system** — loadout of collector plugins (declarative, not dynamic linking)
-14. **Export formats** — JSON, CSV, markdown report generation
-15. **Web dashboard** — local-first SPA reading JSONL directly
-16. **Encrypted storage** — optional at-rest encryption for sensitive metadata
-
----
-
-## How to Extend the Pipeline
-
-### Add a new collector
-1. Create file in `collector/{platform}/{source}.rs`
-2. Implement `pub fn get_{source}() -> Option<...>`
-3. Add `pub mod {source};` to `collector/{platform}/mod.rs`
-4. Add the call in `main.rs:run_tracking_loop()`
-5. Log the raw event with `log_event()`
-6. Process/enrich via `SessionManager`
-
-### Add a new enrichment field
-1. Add field to `EnrichedEvent` in `models/enriched.rs`
-2. Add extraction logic in `processing/enrich.rs:enrich_event()`
-3. (Optional) Update `ActivityGroup` if the field should be aggregated
-
-### Add a new workflow type
-1. Add variant to `TerminalWorkflow` enum
-2. Add `label()` match arm
-3. Add base commands to `classify_command()` match
-
-### Add a new report format
-1. Create function in `processing/summary.rs` or a new module
-2. Accept `&[ActivityGroup]` or `&ActivityGroup`
-3. Return formatted string or structured output
-4. Wire to a CLI command
+Simpler at current scale (2 platforms, <1200 LOC). Extract a `TelemetryCollector` trait when more platforms are added.
 
 ---
 
 ## Important Implementation Notes
 
 ### The `WindowInfo` Problem
-Two different `WindowInfo` structs exist (linux and windows), both with identical fields. They need unification. Currently `get_platform_telemetry()` on Windows returns `None` for window info because of the type mismatch. Fix: extract `WindowInfo` into `models/` and share.
+Two identical `WindowInfo` structs exist (linux and windows). Currently `get_platform_telemetry()` on Windows returns `None`. Fix: extract `WindowInfo` into `models/` and share.
 
 ### The `last_event` Merge Semantics
-`SessionManager::process_window_session` compares the new event against `self.last_event`. If app, title, and workspace match, the durations are merged. If anything differs, the old event is flushed and a new one starts. This means rapid alt-tab switches between the same app+title produce a single merged session — correct and intentional.
+`SessionManager::process_window_session` compares against `self.last_event`. Matches on (app, title, workspace) — durations are merged. This means rapid alt-tab switches between the same app+title produce a single merged session.
 
 ### Idle Detection Edge Case
-The idle detector transitions from `!idle_active` to `idle_active` on first crossing of threshold. It stays `idle_active` until idle drops below threshold. During idle, window polling is skipped. This means the first non-idle poll sees a PITI (point-in-time) window snapshot with unknown idle duration — the loop relies on the `last_window` comparison and `focus_start` timer to calculate accurate focus duration.
+The idle detector transitions from `!idle_active` to `idle_active` on first crossing of threshold. During idle, window polling is skipped. The first non-idle poll relies on `last_window` comparison and `focus_start` timer for accurate duration.
 
 ### Threading Model
-Single-threaded synchronous loop. `ctrlc` sets an `AtomicBool` flag checked on each iteration. No async, no channels, no locks (except the atomic flag). This is by design — collector calls are fast I/O, not blocking operations.
+Single-threaded synchronous loop. `ctrlc` sets an `AtomicBool` flag. No async, no channels, no locks. Collector calls are fast I/O (< 50ms).
+
+### Config Loading
+Config is loaded once at startup. Changes to `tracker.toml` require a restart. Environment variables are read at startup only.

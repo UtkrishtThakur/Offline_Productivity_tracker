@@ -3,11 +3,8 @@ from collections import defaultdict
 from pathlib import Path
 
 
-NORMALIZED_LOG = "../sessions/active_session/normalized_sessions.jsonl"
-
-
-def load_logs():
-    path = Path(NORMALIZED_LOG)
+def load_logs(cfg):
+    path = Path(cfg.normalized_log)
 
     if not path.exists():
         return []
@@ -17,10 +14,8 @@ def load_logs():
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
-
             if not line:
                 continue
-
             try:
                 logs.append(json.loads(line))
             except json.JSONDecodeError:
@@ -42,7 +37,6 @@ def aggregate_logs(logs):
 
     for log in logs:
         project = log.get("project") or "unknown"
-
         entry = projects[project]
 
         entry["time_sec"] += log.get("total_duration_sec", 0)
@@ -61,19 +55,16 @@ def aggregate_logs(logs):
             entry["terminal_workflows"].add(workflow)
 
         git_summary = log.get("git_summary")
-
         if git_summary:
             entry["git_commits"] += git_summary.get("commit_count", 0)
-
             for area in git_summary.get("dev_areas", []):
                 entry["dev_areas"].add(area)
 
     return projects
 
 
-def build_ai_context():
-    logs = load_logs()
-
+def build_ai_context(cfg):
+    logs = load_logs(cfg)
     aggregated = aggregate_logs(logs)
 
     final = {}
