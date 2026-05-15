@@ -35,6 +35,20 @@ events_file = "events.jsonl"
 # Normalized activity group filename (within session_dir)
 normalized_file = "normalized_sessions.jsonl"
 
+# Per-day summary archival directory
+# Each finalized day gets: summaries/YYYY-MM-DD/{deterministic.txt,metadata.json}
+summaries_dir = "../sessions/summaries"
+
+[summary]
+# Automatically delete a day's raw/normalized logs after successful archival
+auto_cleanup = true
+
+# Max retry attempts for AI semantic summary generation
+retry_attempts = 3
+
+# Delay in seconds between AI summary retries
+retry_delay_sec = 30
+
 [ai_analyzer]
 # Enable AI-powered daily summaries via py-analyzer + Ollama
 # When false, tracker works fully without Python/AI dependencies
@@ -46,7 +60,7 @@ ollama_host = "http://localhost:11434"
 # LLM model to use for summaries
 model = "qwen2.5:7b"
 
-# Output directory for AI-generated summaries
+# Output directory for AI-generated summaries (legacy path)
 output_dir = "outputs"
 
 [logging]

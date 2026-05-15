@@ -204,11 +204,50 @@ On Ctrl+C:
         └── logger.log_normalized_session() for each group
 ```
 
-### CLI Commands (`cli/commands.rs`)
+### Tracking Loop (`main.rs:run_tracking_loop`)
+
+Polls every `tracking.poll_interval_sec` (default 3s). All thresholds read from config:
+
+```
+loop (every poll_interval_sec):
+    [DAY ROTATION]
+    if today != current_date:
+        1. manager.finalize() — flush pending
+        2. Read all groups from normalized_sessions.jsonl
+        3. Filter groups matching previous date
+        4. archiver.finalize_day(date, groups, storage)
+           ├── write deterministic.txt
+           ├── write metadata.json (status=finalized)
+           └── if auto_cleanup: rewrite JSONL files without that day
+        5. If AI enabled:
+           ├── invoke_ai_analyzer(ctx, Some(&date))
+           │   └── on success: update metadata.json (semantic_summary)
+           └── on failure: push PendingAiJob to retry queue
+        6. current_date = today
+        7. manager = fresh SessionManager
+
+    [AI RETRY QUEUE]
+    if ai_enabled && pending_ai not empty:
+        for each pending job where last_attempt + retry_delay has passed:
+            retry AI analyzer
+            on success: update metadata, remove from queue
+            on failure: increment retry_count; if max retries reached,
+                        mark metadata as failed, remove from queue
+
+    [COLLECTORS] (unchanged)
+    1. Window info, idle, terminal, git
+    2. Idle check, window tracking, terminal, git
+    └── sleep(poll_interval_sec)
+
+On Ctrl+C:
+    manager.finalize() — flush remaining (no forced rotation)
+```
+
+## CLI Commands (`cli/commands.rs`)
 
 | Command | Behavior |
 |---------|----------|
-| `tracker [--config PATH] Start` | Logs `tracker_started`, enters tracking loop |
+| `tracker [--config PATH] Start` | Logs `tracker_started`, archives pending days, enters tracking loop |
 | `tracker [--config PATH] Pause` | Logs `tracker_paused` event |
 | `tracker [--config PATH] Resume` | Logs `tracker_resumed` event |
 | `tracker [--config PATH] Stop` | Logs `tracker_stopped` event |
@@ -217,6 +256,8 @@ On Ctrl+C:
 | `tracker InitConfig` | Writes default `tracker.toml` to CWD |
 
 Note: Pause/Resume/Stop currently only log events — they don't actually pause/stop the running loop. This is an intended extension point.
+
+On `Start`, the system first calls `archiver.archive_pending_days()` which reads the entire normalized log, groups entries by date, and archives any complete day that does not yet have a summary. This ensures crash recovery across restarts.
 
 ---
 
@@ -512,6 +553,37 @@ main.rs
 ```
 
 ---
+
+## Daily Rotation & Archival (`storage/archiver.rs`, `processing/daily.rs`)
+
+### `processing/daily.rs`
+- `format_timeline_summary(groups, date)` → chronological deterministic timeline text
+- `extract_date(rfc3339)` → `YYYY-MM-DD` string for grouping
+
+### `storage/archiver.rs`
+- `Archiver` struct manages per-day summary directories under `summaries_dir`
+- `finalize_day()` orchestrates: write deterministic.txt → write metadata.json → optional cleanup
+- `archive_pending_days()` startups: scans all normalized sessions, archives any completed day without a summary
+- `cleanup_day_logs()` atomically rewrites JSONL (tmp+rename) to remove a finalized day's entries
+- `DayMetadata` tracks status, retry_count, errors, and per-day aggregate stats
+
+### Summary directory layout
+```
+summaries/YYYY-MM-DD/
+  deterministic.txt   # always — timeline from format_timeline_summary()
+  semantic.txt        # only when AI succeeds (written by py-analyzer)
+  metadata.json       # always — status, stats, error info
+```
+
+### Cleanup semantics
+After a day is finalized with `status=finalized`:
+- `normalized_sessions.jsonl` and `events.jsonl` are rewritten (tmp+rename) without that day's entries
+- This keeps active logs small — only the current day's data remains
+
+### AI retry queue
+- On day rotation, if AI is enabled and `invoke_ai_analyzer` fails, a `PendingAiJob` is queued
+- Each loop iteration, pending jobs with elapsed `retry_delay` are retried
+- After `retry_attempts` failures, metadata is marked `status=failed` and the job is dropped
 
 ## Placeholder / Empty Modules (Extension Points)
 

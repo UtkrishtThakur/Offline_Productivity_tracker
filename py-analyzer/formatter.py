@@ -63,8 +63,7 @@ def aggregate_logs(logs):
     return projects
 
 
-def build_ai_context(cfg):
-    logs = load_logs(cfg)
+def build_ai_context(logs):
     aggregated = aggregate_logs(logs)
 
     final = {}
