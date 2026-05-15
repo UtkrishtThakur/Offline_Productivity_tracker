@@ -12,10 +12,14 @@ fn default_min_meaningful() -> u64 { 2 }
 fn default_session_dir() -> String { "../sessions/active_session".into() }
 fn default_events_file() -> String { "events.jsonl".into() }
 fn default_normalized_file() -> String { "normalized_sessions.jsonl".into() }
+fn default_summaries_dir() -> String { "../sessions/summaries".into() }
 fn default_ollama_host() -> String { "http://localhost:11434".into() }
 fn default_model() -> String { "qwen2.5:7b".into() }
 fn default_ai_output_dir() -> String { "outputs".into() }
 fn default_ai_enabled() -> bool { false }
+fn default_auto_cleanup() -> bool { true }
+fn default_retry_attempts() -> u32 { 3 }
+fn default_retry_delay_sec() -> u64 { 30 }
 fn default_log_enabled() -> bool { true }
 fn default_log_level() -> String { "info".into() }
 
@@ -32,6 +36,8 @@ pub struct TrackerConfig {
     #[serde(default)]
     pub ai_analyzer: AiAnalyzerConfig,
     #[serde(default)]
+    pub summary: SummaryConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -41,6 +47,7 @@ impl Default for TrackerConfig {
             tracking: TrackingConfig::default(),
             storage: StorageConfig::default(),
             ai_analyzer: AiAnalyzerConfig::default(),
+            summary: SummaryConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
@@ -94,6 +101,9 @@ pub struct StorageConfig {
 
     #[serde(default = "default_normalized_file")]
     pub normalized_file: String,
+
+    #[serde(default = "default_summaries_dir")]
+    pub summaries_dir: String,
 }
 
 impl Default for StorageConfig {
@@ -102,6 +112,7 @@ impl Default for StorageConfig {
             session_dir: default_session_dir(),
             events_file: default_events_file(),
             normalized_file: default_normalized_file(),
+            summaries_dir: default_summaries_dir(),
         }
     }
 }
@@ -132,6 +143,32 @@ impl Default for AiAnalyzerConfig {
             ollama_host: default_ollama_host(),
             model: default_model(),
             output_dir: default_ai_output_dir(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Summary archival (daily rotation, cleanup, retry)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryConfig {
+    #[serde(default = "default_auto_cleanup")]
+    pub auto_cleanup: bool,
+
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+
+    #[serde(default = "default_retry_delay_sec")]
+    pub retry_delay_sec: u64,
+}
+
+impl Default for SummaryConfig {
+    fn default() -> Self {
+        Self {
+            auto_cleanup: default_auto_cleanup(),
+            retry_attempts: default_retry_attempts(),
+            retry_delay_sec: default_retry_delay_sec(),
         }
     }
 }

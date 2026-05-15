@@ -3,3 +3,4 @@ pub mod terminal;
 pub mod activity;
 pub mod git;
 pub mod summary;
+pub mod daily;

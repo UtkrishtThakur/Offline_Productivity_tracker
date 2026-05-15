@@ -170,6 +170,9 @@ fn apply_env_overrides(mut config: TrackerConfig) -> TrackerConfig {
     if let Ok(v) = std::env::var("TRACKER_NORMALIZED_FILE") {
         config.storage.normalized_file = v;
     }
+    if let Ok(v) = std::env::var("TRACKER_SUMMARIES_DIR") {
+        config.storage.summaries_dir = v;
+    }
 
     // AI Analyzer
     if let Ok(v) = std::env::var("TRACKER_AI_ENABLED") {
@@ -183,6 +186,21 @@ fn apply_env_overrides(mut config: TrackerConfig) -> TrackerConfig {
     }
     if let Ok(v) = std::env::var("TRACKER_AI_OUTPUT_DIR") {
         config.ai_analyzer.output_dir = v;
+    }
+
+    // Summary
+    if let Ok(v) = std::env::var("TRACKER_AUTO_CLEANUP") {
+        config.summary.auto_cleanup = v.eq_ignore_ascii_case("true");
+    }
+    if let Ok(v) = std::env::var("TRACKER_RETRY_ATTEMPTS") {
+        if let Ok(n) = v.parse() {
+            config.summary.retry_attempts = n;
+        }
+    }
+    if let Ok(v) = std::env::var("TRACKER_RETRY_DELAY_SEC") {
+        if let Ok(n) = v.parse() {
+            config.summary.retry_delay_sec = n;
+        }
     }
 
     // Logging
