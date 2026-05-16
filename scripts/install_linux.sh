@@ -52,7 +52,7 @@ echo "[OK] Rust tracker built"
 # -----------------------------
 
 echo "[*] Installing tracker binary..."
-sudo cp rust-tracker/target/release/tracker /usr/local/bin/tracker
+sudo cp rust-tracker/target/release/rust-tracker /usr/local/bin/tracker
 sudo chmod +x /usr/local/bin/tracker
 echo "[OK] Installed tracker command"
 
@@ -62,7 +62,7 @@ echo "[OK] Installed tracker command"
 
 echo "[*] Initializing tracker.toml..."
 if [ ! -f "$CONFIG_DIR/tracker.toml" ]; then
-    tracker InitConfig
+    tracker init-config
     mv tracker.toml "$CONFIG_DIR/tracker.toml"
 fi
 
