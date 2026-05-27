@@ -18,7 +18,7 @@ No `Makefile`/`Justfile` — just `cargo` directly.
 ```bash
 ./target/release/tracker [--config PATH] <SUBCOMMAND>
 ```
-Subcommands: `Start`, `Pause`, `Resume`, `Stop`, `Report`, `ReportAi`, `InitConfig`.
+Subcommands: `Start`, `Pause`, `Resume`, `Stop`, `Report`, `ReportAi`, `InitConfig`, `Doctor`.
 
 - `--config` is a **global flag** before the subcommand.
 - `Pause`/`Resume`/`Stop` only **log events** — they don't actually pause the loop.

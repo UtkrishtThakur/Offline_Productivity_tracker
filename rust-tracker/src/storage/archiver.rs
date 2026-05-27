@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +9,25 @@ use serde_json::Value;
 use crate::config::{StorageConfig, TrackerConfig};
 use crate::models::activity::ActivityGroup;
 use crate::processing::daily;
+
+/// Lifecycle states for a day's summary:
+///
+///   (no metadata) ──→ deterministic_complete ──→ semantic_pending ──→ semantic_complete ──→ finalized
+///                          │                                                  │
+///                          └── (AI disabled) ────────────────────────────────→ finalized
+///                                                                   semantic_pending ──→ failed
+///
+/// - `pending`:                   no metadata written yet
+/// - `deterministic_complete`:    deterministic.txt written, semantic pending
+/// - `semantic_pending`:          AI job queued for retry
+/// - `semantic_complete`:         semantic.txt written by AI analyzer
+/// - `finalized`:                 all summaries written + logs cleaned up
+/// - `failed`:                    retries exhausted, semantic failed permanently
+pub const STATE_DETERMINISTIC_COMPLETE: &str = "deterministic_complete";
+pub const STATE_SEMANTIC_PENDING: &str = "semantic_pending";
+pub const STATE_SEMANTIC_COMPLETE: &str = "semantic_complete";
+pub const STATE_FINALIZED: &str = "finalized";
+pub const STATE_FAILED: &str = "failed";
 
 /// Metadata for a single day's summary directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,12 +73,20 @@ impl Archiver {
         Ok(dir)
     }
 
-    /// Check whether a day already has a finalized summary.
-    pub fn day_has_summary(&self, date: &str) -> bool {
+    /// Check whether a day has any metadata (any lifecycle state).
+    /// Used to avoid re-processing a day on restart.
+    pub fn day_has_metadata(&self, date: &str) -> bool {
+        let meta_path = self.day_dir(date).join("metadata.json");
+        meta_path.exists()
+    }
+
+    /// Check whether a day is fully finalized.
+    #[allow(dead_code)]
+    pub fn day_is_finalized(&self, date: &str) -> bool {
         let meta_path = self.day_dir(date).join("metadata.json");
         if let Ok(content) = fs::read_to_string(&meta_path) {
             if let Ok(meta) = serde_json::from_str::<DayMetadata>(&content) {
-                return meta.status == "finalized";
+                return meta.status == STATE_FINALIZED;
             }
         }
         false
@@ -90,6 +117,70 @@ impl Archiver {
         let dir = self.ensure_day_dir(date)?;
         let content = daily::format_timeline_summary(groups, date);
         fs::write(dir.join("deterministic.txt"), &content)
+    }
+
+    // ── Lifecycle state machine ──────────────────────────────────────────
+
+    /// Write deterministic.txt and create metadata with status `deterministic_complete`.
+    pub fn write_deterministic_summary(
+        &self,
+        date: &str,
+        groups: &[ActivityGroup],
+    ) -> std::io::Result<DayMetadata> {
+        self.write_deterministic(date, groups)?;
+        let meta = self.build_metadata(
+            date,
+            groups,
+            STATE_DETERMINISTIC_COMPLETE,
+            None,
+            None,
+            0,
+        );
+        self.write_metadata(date, &meta)?;
+        Ok(meta)
+    }
+
+    /// Transition metadata from `deterministic_complete` to `semantic_pending`.
+    pub fn mark_semantic_pending(&self, date: &str) -> std::io::Result<()> {
+        if let Ok(Some(mut meta)) = self.read_metadata(date) {
+            meta.status = STATE_SEMANTIC_PENDING.to_string();
+            self.write_metadata(date, &meta)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Transition metadata to `semantic_complete` after successful AI generation.
+    pub fn mark_semantic_complete(&self, date: &str) -> std::io::Result<()> {
+        if let Ok(Some(mut meta)) = self.read_metadata(date) {
+            meta.status = STATE_SEMANTIC_COMPLETE.to_string();
+            meta.semantic_summary = Some("semantic.txt".to_string());
+            self.write_metadata(date, &meta)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Transition metadata to `finalized` after all summaries written and logs cleaned.
+    pub fn mark_finalized(&self, date: &str) -> std::io::Result<()> {
+        if let Ok(Some(mut meta)) = self.read_metadata(date) {
+            meta.status = STATE_FINALIZED.to_string();
+            meta.finalized_at = Some(chrono::Local::now().to_rfc3339());
+            self.write_metadata(date, &meta)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Transition metadata to `failed` after retries exhausted.
+    pub fn mark_failed(&self, date: &str, error: &str) -> std::io::Result<()> {
+        if let Ok(Some(mut meta)) = self.read_metadata(date) {
+            meta.status = STATE_FAILED.to_string();
+            meta.error = Some(error.to_string());
+            self.write_metadata(date, &meta)
+        } else {
+            Ok(())
+        }
     }
 
     /// Build metadata from a set of groups for a given day.
@@ -135,30 +226,14 @@ impl Archiver {
             semantic_summary: semantic_path,
             error,
             retry_count,
-            finalized_at: Some(chrono::Local::now().to_rfc3339()),
+            finalized_at: None,
         }
     }
 
-    /// Finalize a day: write deterministic.txt, metadata.json, then optionally clean up logs.
-    pub fn finalize_day(
-        &self,
-        date: &str,
-        groups: &[ActivityGroup],
-        storage: &StorageConfig,
-    ) -> std::io::Result<DayMetadata> {
-        self.write_deterministic(date, groups)?;
-
-        let meta = self.build_metadata(date, groups, "finalized", None, None, 0);
-        self.write_metadata(date, &meta)?;
-
-        if self.auto_cleanup {
-            self.cleanup_day_logs(date, storage)?;
-        }
-
-        Ok(meta)
-    }
+    // ── Cleanup ──────────────────────────────────────────────────────────
 
     /// Rewrite JSONL files to remove entries matching a given date.
+    /// Must only be called after ALL summaries are complete and persisted.
     pub fn cleanup_day_logs(&self, date: &str, storage: &StorageConfig) -> std::io::Result<()> {
         let session_dir = PathBuf::from(&storage.session_dir);
 
@@ -175,46 +250,6 @@ impl Archiver {
         }
 
         Ok(())
-    }
-
-    /// Archive any unarchived previous days from the current set of groups.
-    /// Returns the groups that belong to today.
-    pub fn archive_pending_days<'a>(
-        &self,
-        groups: &'a [ActivityGroup],
-        today: &str,
-        storage: &StorageConfig,
-    ) -> std::io::Result<Vec<&'a ActivityGroup>> {
-        let mut by_date: BTreeSet<String> = BTreeSet::new();
-        for g in groups {
-            if let Some(d) = daily::extract_date(&g.start_time) {
-                if d != today {
-                    by_date.insert(d.to_string());
-                }
-            }
-        }
-
-        for date in &by_date {
-            if self.day_has_summary(date) {
-                continue;
-            }
-            let day_groups: Vec<ActivityGroup> = groups
-                .iter()
-                .filter(|g| {
-                    daily::extract_date(&g.start_time) == Some(date.as_str())
-                })
-                .cloned()
-                .collect();
-
-            if !day_groups.is_empty() {
-                self.finalize_day(date, &day_groups, storage)?;
-            }
-        }
-
-        Ok(groups
-            .iter()
-            .filter(|g| daily::extract_date(&g.start_time) == Some(today))
-            .collect())
     }
 }
 
@@ -240,17 +275,26 @@ fn line_matches_date(line: &str, date: &str) -> bool {
 }
 
 /// Read a JSONL file, filter lines, and atomically rewrite it via a temp file.
-fn filter_jsonl_file(path: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<()> {
-    let content = fs::read_to_string(path)?;
-    let filtered: Vec<&str> = content.lines().filter(|l| keep(l)).collect();
+fn filter_jsonl_file(path: &std::path::Path, keep: impl Fn(&str) -> bool) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, BufWriter};
+
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
 
     let tmp_path = path.with_extension("jsonl.tmp");
     {
-        let mut tmp = fs::File::create(&tmp_path)?;
-        for line in &filtered {
-            writeln!(tmp, "{}", line)?;
+        let tmp_file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(tmp_file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if keep(&line) {
+                writeln!(writer, "{}", line)?;
+            }
         }
+        writer.flush()?;
     }
+
     fs::rename(&tmp_path, path)?;
     Ok(())
 }
@@ -295,18 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_pending_days_no_previous() {
-        let config = TrackerConfig::default();
-        let archiver = Archiver::new(&config);
-        let groups = vec![make_group("2026-05-14T09:00:00+00:00")];
-        let result = archiver.archive_pending_days(&groups, "2026-05-14", &config.storage);
-        assert!(result.is_ok());
-        let today_groups = result.unwrap();
-        assert_eq!(today_groups.len(), 1);
+    fn test_extract_date_filtering() {
+        assert!(daily::extract_date("2026-05-14T09:00:00+00:00") == Some("2026-05-14"));
     }
 
     #[test]
-    fn test_extract_date_filtering() {
-        assert!(daily::extract_date("2026-05-14T09:00:00+00:00") == Some("2026-05-14"));
+    fn test_state_constants() {
+        assert_eq!(STATE_DETERMINISTIC_COMPLETE, "deterministic_complete");
+        assert_eq!(STATE_SEMANTIC_PENDING, "semantic_pending");
+        assert_eq!(STATE_SEMANTIC_COMPLETE, "semantic_complete");
+        assert_eq!(STATE_FINALIZED, "finalized");
+        assert_eq!(STATE_FAILED, "failed");
     }
 }

@@ -13,6 +13,7 @@ ctrlc = "3.4"
 toml = { version = "0.8", features = ["display"] }
 dirs = "5"
 ureq = { version = "2", features = ["json"] }
+fs2 = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.52.0", features = [

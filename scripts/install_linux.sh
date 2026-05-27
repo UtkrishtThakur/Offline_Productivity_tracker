@@ -63,6 +63,9 @@ echo "[OK] Installed tracker command"
 echo "[*] Initializing tracker.toml..."
 if [ ! -f "$CONFIG_DIR/tracker.toml" ]; then
     tracker init-config
+    # Set absolute paths in the generated config
+    sed -i "s|session_dir = .*|session_dir = \"$DATA_DIR/sessions\"|g" tracker.toml
+    sed -i "s|summaries_dir = .*|summaries_dir = \"$DATA_DIR/summaries\"|g" tracker.toml
     mv tracker.toml "$CONFIG_DIR/tracker.toml"
 fi
 

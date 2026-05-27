@@ -27,4 +27,6 @@ pub enum Commands {
     ReportAi,
     /// Write a default tracker.toml to the current directory
     InitConfig,
+    /// Run diagnostic health checks on configuration, paths, and dependencies
+    Doctor,
 }

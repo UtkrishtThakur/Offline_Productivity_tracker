@@ -1,9 +1,9 @@
 mod settings;
 
 pub use settings::*;
-
 use std::fmt;
 use std::path::PathBuf;
+use crate::utils::paths::resolve_path;
 
 // ---------------------------------------------------------------------------
 // AppContext — shared runtime context holding the parsed config
@@ -18,7 +18,7 @@ pub struct AppContext {
 impl AppContext {
     pub fn load(cli_config_path: Option<&str>) -> Result<Self, ConfigError> {
         let config_path = resolve_config_path(cli_config_path)?;
-        let config = match &config_path {
+        let mut config = match &config_path {
             Some(path) => {
                 let contents = std::fs::read_to_string(path)
                     .map_err(|e| ConfigError::Io {
@@ -33,6 +33,23 @@ impl AppContext {
             }
             None => TrackerConfig::default(),
         };
+
+        // Resolve absolute paths based on config file location or CWD
+        let base_path = config_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        // Normalize paths
+        config.storage.session_dir = resolve_path(&config.storage.session_dir, &base_path)
+            .to_string_lossy()
+            .to_string();
+        config.storage.summaries_dir = resolve_path(&config.storage.summaries_dir, &base_path)
+            .to_string_lossy()
+            .to_string();
+        config.ai_analyzer.output_dir = resolve_path(&config.ai_analyzer.output_dir, &base_path)
+            .to_string_lossy()
+            .to_string();
 
         let config = apply_env_overrides(config);
 
